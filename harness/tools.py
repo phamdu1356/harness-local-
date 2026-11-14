@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import fnmatch
 import html
+import json
 import os
 import re
 import shutil
 import subprocess
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,6 +63,35 @@ class Tool:
             except (TypeError, ValueError):
                 return f"LỖI: tham số {k} phải là {spec['type']}, nhận {v!r}."
         return out
+
+
+def parse_search_results(page: str, num: int = 5) -> str:
+    """Trích tiêu đề, URL, đoạn trích từ trang kết quả html.duckduckgo.com."""
+    def text(x: str) -> str:
+        return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", x))).strip()
+
+    out = []
+    blocks = re.split(r'<div[^>]+class="[^"]*\bresult\b[^"]*"', page)[1:]
+    for b in blocks:
+        a = re.search(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', b, re.S)
+        if not a:
+            continue
+        href = html.unescape(a.group(1))
+        m = re.search(r"uddg=([^&]+)", href)
+        url = urllib.parse.unquote(m.group(1)) if m else href
+        sn = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', b, re.S)
+        out.append(f"{len(out) + 1}. {text(a.group(2))}\n   {url}" + (f"\n   {clip(text(sn.group(1)), 240)}" if sn else ""))
+        if len(out) >= num:
+            break
+    return "\n".join(out)
+
+
+def format_searx(data: dict, num: int = 5) -> str:
+    out = []
+    for r in (data.get("results") or [])[:num]:
+        out.append(f"{len(out) + 1}. {r.get('title', '').strip()}\n   {r.get('url', '')}"
+                   + (f"\n   {clip(r['content'].strip(), 240)}" if r.get("content") else ""))
+    return "\n".join(out)
 
 
 class Workspace:
@@ -186,6 +217,29 @@ def build_tools(ws: Workspace, bash_timeout: int = 60) -> dict[str, Tool]:
             raw = re.sub(r"\n\s*\n+", "\n\n", raw)
         return clip(raw.strip(), 6000)
 
+    def web_search(query: str, num: int = 5) -> str:
+        num = max(1, min(num, 10))
+        if searx := os.environ.get("HARNESS_SEARX_URL"):  # SearXNG của bạn (API JSON), ổn định hơn
+            url = searx.rstrip("/") + "/search?" + urllib.parse.urlencode({"q": query, "format": "json"})
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "harness/0.1"}),
+                                            timeout=20) as r:
+                    return format_searx(json.load(r), num) or "Không có kết quả."
+            except Exception as e:
+                return f"LỖI tìm kiếm (SearXNG): {e}"
+        url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "harness/0.1"}),
+                                        timeout=15) as r:
+                status, page = r.status, r.read(1_000_000).decode("utf-8", errors="replace")
+        except Exception as e:
+            return f"LỖI tìm kiếm: {e}"
+        out = parse_search_results(page, num)
+        if not out and (status == 202 or re.search(r"anomaly|captcha", page, re.I)):
+            return ("LỖI: DuckDuckGo đang chặn truy vấn tự động. Thử lại sau, hoặc đặt HARNESS_SEARX_URL trỏ tới "
+                    "một SearXNG của bạn, hoặc dùng web_fetch với một URL cụ thể.")
+        return out or "Không có kết quả."
+
     def todo(todos: str) -> str:
         """Danh sách việc: mỗi dòng '[ ] việc' / '[~] đang làm' / '[x] xong'."""
         todo_state[:] = [l.rstrip() for l in todos.splitlines() if l.strip()]
@@ -203,6 +257,8 @@ def build_tools(ws: Workspace, bash_timeout: int = 60) -> dict[str, Tool]:
         Tool("grep", "Tìm regex trong nội dung file, trả về file:dòng.",
              {"pattern": P(S, "regex Python"), "path": P(S, "file/thư mục", True),
               "include": P(S, "lọc tên file, vd '*.py'", True)}, grep, read_only=True),
+        Tool("web_search", "Tìm kiếm web, trả về tiêu đề, URL và đoạn trích. Dùng web_fetch để đọc kỹ một kết quả.",
+             {"query": P(S, "từ khoá tìm kiếm"), "num": P(I, "số kết quả, mặc định 5", True)}, web_search, read_only=True),
         Tool("todo", "Ghi/cập nhật kế hoạch cho việc nhiều bước. Mỗi dòng: '[ ] việc', '[~] đang làm', '[x] xong'.",
              {"todos": P(S, "toàn bộ danh sách, mỗi việc một dòng")}, todo, read_only=True),
         Tool("write_file", "Tạo file mới hoặc ghi đè toàn bộ file.",

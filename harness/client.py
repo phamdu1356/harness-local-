@@ -13,6 +13,8 @@ class Reply:
     content: str = ""
     thinking: str = ""
     tool_calls: list[dict] = field(default_factory=list)  # [{"id", "name", "arguments"(dict)}]
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class LLMError(RuntimeError):
@@ -33,6 +35,21 @@ class LMStudioClient:
             raise LLMError(f"Không kết nối được LM Studio tại {self.host}. "
                            "Mở LM Studio → tab Developer → Start Server.") from e
 
+    def context_length(self) -> int | None:
+        """Context đang nạp của model: LM Studio (/api/v0/models) hoặc llama-server (/props)."""
+        for path, pick in (
+            ("/api/v0/models", lambda d: next((m.get("loaded_context_length") for m in d.get("data", [])
+                                               if m.get("id") == self.model and m.get("state") == "loaded"), None)),
+            ("/props", lambda d: d.get("default_generation_settings", {}).get("n_ctx")),
+        ):
+            try:
+                with urllib.request.urlopen(f"{self.host}{path}", timeout=3) as r:
+                    if n := pick(json.load(r)):
+                        return int(n)
+            except Exception:
+                continue
+        return None
+
     def ensure_model(self) -> str:
         if not self.model:  # dùng model đầu tiên đang load trong LM Studio
             models = [m for m in self.list_models() if "embed" not in m]
@@ -45,7 +62,7 @@ class LMStudioClient:
              on_token: Callable[[str], None] | None = None,
              on_thinking: Callable[[str], None] | None = None) -> Reply:
         body = {"model": self.ensure_model(), "messages": messages, "stream": True,
-                "temperature": self.temperature}
+                "stream_options": {"include_usage": True}, "temperature": self.temperature}
         if tools:
             body["tools"] = tools
         req = urllib.request.Request(
@@ -64,6 +81,9 @@ class LMStudioClient:
                     chunk = json.loads(data)
                     if "error" in chunk:
                         raise LLMError(str(chunk["error"]))
+                    if u := chunk.get("usage"):
+                        reply.prompt_tokens = u.get("prompt_tokens", 0)
+                        reply.completion_tokens = u.get("completion_tokens", 0)
                     for choice in chunk.get("choices", []):
                         d = choice.get("delta", {})
                         if t := d.get("reasoning_content") or d.get("reasoning"):

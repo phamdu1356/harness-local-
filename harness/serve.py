@@ -83,7 +83,8 @@ def find_model(spec: str | None) -> Path:
 
 class LocalServer:
     def __init__(self, model: Path, port: int = 8081, ctx: int = 16384, gpu_layers: int = 99,
-                 reasoning: str = "auto", kv_quant: str = "q8_0", cpu: bool = False, threads: int = 0):
+                 reasoning: str = "auto", kv_quant: str = "q8_0", cpu: bool = False, threads: int = 0, effort: str = "default"):
+        self.effort = effort
         self.model, self.port, self.ctx = model, port, ctx
         self.cpu, self.threads = cpu, threads
         self.gpu_layers = 0 if cpu else gpu_layers
@@ -99,7 +100,7 @@ class LocalServer:
         return [binary, "-m", str(self.model), "--host", "127.0.0.1", "--port", str(self.port),
                 "-c", str(self.ctx), "-ngl", str(self.gpu_layers), "-fa", "on",
                 "-ctk", self.kv_quant, "-ctv", self.kv_quant, "--jinja", "--no-webui",
-                "--reasoning", self.reasoning, "--alias", "local"] + (["-t", str(self.threads)] if self.threads else [])
+                "--reasoning", self.reasoning, "--reasoning-effort", self.effort, "--alias", "local"] + (["-t", str(self.threads)] if self.threads else [])
 
     def healthy(self) -> bool:
         try:

@@ -72,7 +72,7 @@ class UI:
         self.w(f"{self.c('accent', '│')} {self.c('bold', 'harness')} {self.c('muted', 'agent cho LLM local')}")
         self.w(f"{self.c('accent', '│')} {self.c('muted', 'model')} {model}")
         self.w(f"{self.c('accent', '│')} {self.c('muted', 'thư mục')} {cwd}")
-        self.w(f"{self.c('accent', '│')} {self.c('dim', '/clear · /memory · /forget · /exit · Ctrl+C ngắt')}")
+        self.w(f"{self.c('accent', '│')} {self.c('dim', '/clear · /context · /memory · /forget · /exit')}")
         self.w(self.c("accent", f"╰{line}"))
 
     def prompt(self) -> str:
@@ -128,8 +128,12 @@ class UI:
         self.end_stream()
         self.w(self.c("muted", f"◌ nhớ lại {n} mục từ bộ nhớ ngoài"))
 
-    def footer(self, seconds: float, steps: int):
-        self.w(self.c("dim", f"  ⏱ {seconds:.1f}s · {steps} lượt"))
+    def summary_note(self):
+        self.end_stream()
+        self.w(self.c("muted", "◌ đã tóm tắt hội thoại cũ để giải phóng context"))
+
+    def footer(self, seconds: float, steps: int, ctx: str = ""):
+        self.w(self.c("dim", f"  ⏱ {seconds:.1f}s · {steps} lượt" + (f" · ctx {ctx}" if ctx else "")))
 
     def error(self, msg: str):
         self.w(self.c("err", f"✗ {msg}"))

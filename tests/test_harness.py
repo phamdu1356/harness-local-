@@ -239,3 +239,192 @@ class LexicalFilterTests(unittest.TestCase):
         self.assertTrue(ls("Mật khẩu wifi là ZEBRA42", "zebra42 là gì"))                # mã định danh
         self.assertTrue(ls("Mật khẩu wifi", "mat khau"))                                # gõ không dấu → so sánh bỏ dấu
         self.assertFalse(ls("Mật khẩu wifi", "hôm nay là gì"))                          # chỉ có từ phổ biến
+
+
+class EffortTests(unittest.TestCase):
+    def test_effort_changes_prompt_and_server_flag(self):
+        from pathlib import Path
+        from harness.serve import LocalServer
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        mk = lambda e: Agent(FakeClient([]), build_tools(ws), ws, ui=UI(io.StringIO()), effort=e).messages[0]["content"]
+        self.assertIn("ngắn gọn", mk("low"))
+        self.assertIn("tự kiểm tra lại", mk("high"))
+        self.assertNotIn("{effort_rule}", mk("medium"))
+        cmd = LocalServer(Path("/m"), effort="high").command("/b")
+        self.assertEqual(cmd[cmd.index("--reasoning-effort") + 1], "high")
+
+
+class WebSearchParseTest(unittest.TestCase):
+    def test_parse(self):
+        from harness.tools import parse_search_results
+        page = ('<div class="result results_links"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com%2Fx&amp;rut=1">Tiêu &amp; đề</a>'
+                '<a class="result__snippet" href="x">Đoạn <b>trích</b></a></div>'
+                '<div class="result results_links"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fb.org">B</a></div>')
+        out = parse_search_results(page)
+        self.assertIn("1. Tiêu & đề\n   https://a.com/x\n   Đoạn trích", out)
+        self.assertIn("2. B\n   https://b.org", out)
+
+
+class MCPTests(unittest.TestCase):
+    def test_load_and_call(self):
+        import json, sys
+        from pathlib import Path
+        from harness.mcp import load_mcp_tools
+        d = tempfile.TemporaryDirectory()
+        (Path(d.name) / ".harness").mkdir()
+        (Path(d.name) / ".harness" / "mcp.json").write_text(json.dumps(
+            {"mcpServers": {"demo": {"command": sys.executable, "args": [str(Path(__file__).parent / "fake_mcp.py")]},
+                            "hong": {"command": "/không/có/lệnh/này"}}}))
+        warns = []
+        tools, servers = load_mcp_tools(Path(d.name), warn=warns.append)
+        try:
+            self.assertEqual(set(tools), {"demo__echo", "demo__boom"})
+            self.assertEqual(len(warns), 1)  # server hỏng bị bỏ qua, không làm sập
+            t = tools["demo__echo"]
+            self.assertEqual(t.clean_args({"text": "ab", "times": "2"}), {"text": "ab", "times": 2})
+            self.assertEqual(t.fn(text="ab", times=2), "abab")
+            self.assertEqual(t.schema()["function"]["parameters"]["required"], ["text"])
+            self.assertTrue(tools["demo__boom"].fn().startswith("LỖI: hỏng rồi"))
+        finally:
+            for s in servers:
+                s.stop()
+
+
+class DelegateTest(unittest.TestCase):
+    def test_delegate_returns_only_conclusion(self):
+        from harness.agent import delegate_tool
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        (ws.root / "a.py").write_text("x = 1\n")
+        tools = build_tools(ws)
+        client = FakeClient([Reply(tool_calls=[{"id": "1", "name": "read_file", "arguments": {"path": "a.py"}}]),
+                             Reply(content="Kết luận: a.py đặt x = 1")])
+        parent = Agent(client, tools, ws, ui=UI(io.StringIO()))
+        out = delegate_tool(parent).fn(task="a.py làm gì?")
+        self.assertEqual(out, "Kết luận: a.py đặt x = 1")
+
+
+class SmartClient:
+    """Trả lời tóm tắt khi bị gọi để tóm tắt; còn lại theo kịch bản."""
+    def __init__(self, script, prompt_tokens=0, fail_first=None):
+        self.script, self.prompt_tokens, self.fail_first, self.summaries = list(script), prompt_tokens, fail_first, 0
+
+    def chat(self, messages, tools=None, on_token=None, on_thinking=None):
+        from harness.agent import SUMMARY_SYSTEM
+        if messages[0]["content"] == SUMMARY_SYSTEM:
+            self.summaries += 1
+            return Reply(content="- người dùng đã hỏi vài câu; mật khẩu là ZEBRA42")
+        if self.fail_first:
+            e, self.fail_first = self.fail_first, None
+            raise e
+        r = self.script.pop(0)
+        r.prompt_tokens = self.prompt_tokens
+        return r
+
+
+class ContextFeatureTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.ws = Workspace(self.d.name)
+
+    def agent(self, client, **kw):
+        return Agent(client, build_tools(self.ws), self.ws, ui=UI(io.StringIO()), **kw)
+
+    def test_calibrate_and_ctx_info(self):
+        a = self.agent(SmartClient([Reply(content="ok")], prompt_tokens=1500), max_context_tokens=10000, ctx_total=16000)
+        a.run("xin chào")
+        self.assertEqual(a.last_prompt_tokens, 1500)
+        self.assertEqual(a.ctx_info(), "1.5k/16.0k")
+        self.assertNotEqual(a._cpt, 3.0)  # đã học lại tỉ lệ ký tự/token từ server
+
+    def test_summary_on_eviction(self):
+        from harness.memory import Memory
+        c = SmartClient([Reply(content="x" * 300)] * 6)
+        a = self.agent(c, memory=Memory(":memory:", "s"), summarize=True, max_context_chars=1300)
+        for q in ["mật khẩu là ZEBRA42", "chuyện 2", "chuyện 3", "chuyện 4"]:
+            a.run(q)
+        self.assertGreater(c.summaries, 0)
+        self.assertIn("ZEBRA42", a.summary)
+        self.assertIn("ZEBRA42", a.messages[0]["content"])   # bản tóm tắt nằm trong prompt hệ thống
+
+    def test_summary_works_without_memory(self):
+        c = SmartClient([Reply(content="x" * 300)] * 6)
+        a = self.agent(c, summarize=True, max_context_chars=1300)
+        for q in ["a", "b", "c", "d"]:
+            a.run(q)
+        self.assertGreater(c.summaries, 0)
+
+    def test_overflow_retry(self):
+        from harness.client import LLMError
+        c = SmartClient([Reply(content="xong")], fail_first=LLMError("HTTP 400: context size exceeded"))
+        self.assertEqual(self.agent(c).run("x"), "xong")
+        c2 = SmartClient([], fail_first=LLMError("HTTP 500: lỗi khác"))
+        with self.assertRaises(LLMError):
+            self.agent(c2).run("x")
+
+    def test_save_load_roundtrip(self):
+        from harness.memory import Memory
+        a = self.agent(SmartClient([Reply(content="đáp 1")]), memory=Memory(":memory:", "phien-A"))
+        a.run("câu 1")
+        a.summary = "- tóm tắt"
+        a.save(self.ws.root / "s.json")
+        m2 = Memory(":memory:", "phien-B")
+        b = self.agent(SmartClient([]), memory=m2)
+        self.assertTrue(b.load(self.ws.root / "s.json"))
+        self.assertEqual((b.turn, b.summary, m2.session), (1, "- tóm tắt", "phien-A"))
+        self.assertIn("tóm tắt", b.messages[0]["content"])
+        self.assertFalse(b.load(self.ws.root / "khong-co.json"))
+
+    def test_full_autonomy_by_default_and_ask_mode(self):
+        call = Reply(tool_calls=[{"id": "1", "name": "write_file", "arguments": {"path": "f.txt", "content": "hi"}}])
+        self.agent(SmartClient([call, Reply(content="xong")])).run("tạo")
+        self.assertTrue((self.ws.root / "f.txt").exists())          # không hỏi duyệt
+        (self.ws.root / "f.txt").unlink()
+        a = self.agent(SmartClient([call, Reply(content="xong")]), auto_approve=False, approve=lambda n, x: False)
+        a.run("tạo")
+        self.assertFalse((self.ws.root / "f.txt").exists())          # --ask thì vẫn chặn được
+
+
+class EvalRunnerTests(unittest.TestCase):
+    def ns(self):
+        import argparse
+        return argparse.Namespace(effort="medium", text_tools=False, max_steps=10, no_summary=True, ask=False,
+                                  embedder=None, no_memory=True)
+
+    def test_run_task_pass_and_fail(self):
+        from harness.evals import TASKS, run_task
+        fix = next(t for t in TASKS if t.name == "fix_bug")
+        edit = Reply(tool_calls=[{"id": "1", "name": "edit_file",
+                                  "arguments": {"path": "calc.py", "old": "a - b", "new": "a + b"}}])
+        r = run_task(self.ns(), SmartClient([edit, Reply(content="đã sửa")]), 16000, fix)
+        self.assertTrue(r.passed, r.detail)
+        self.assertEqual(r.tool_calls, 1)
+        r2 = run_task(self.ns(), SmartClient([Reply(content="không làm gì")]), 16000, fix)
+        self.assertFalse(r2.passed)
+
+    def test_checks(self):
+        from harness.evals import _count_callers, _not_found, _precise_edit
+        self.assertTrue(_not_found(None, ["File không tồn tại."])[0])
+        self.assertFalse(_not_found(None, ["Nội dung là: hello"])[0])
+        self.assertTrue(_count_callers(None, ["Có 2 file."])[0])
+        self.assertFalse(_count_callers(None, ["Có 3 file."])[0])
+        d = tempfile.TemporaryDirectory()
+        from pathlib import Path
+        (Path(d.name) / "settings.ini").write_text("[server]\nhost = 0.0.0.0\nport = 9090\ndebug = false\n")
+        self.assertTrue(_precise_edit(Path(d.name), [])[0])
+
+    def test_compare(self):
+        import json
+        from pathlib import Path
+        from harness.evals import compare
+        d = tempfile.TemporaryDirectory()
+        f = Path(d.name) / "old.json"
+        f.write_text(json.dumps({"label": "cũ", "results": [{"task": "t", "passed": False}, {"task": "t", "passed": True}]}))
+        out = compare(str(f), [{"task": "t", "passed": True}, {"task": "t", "passed": True}])
+        self.assertIn("1/2 → 2/2 ▲", out)
+
+
+class SearchBackendTests(unittest.TestCase):
+    def test_format_searx(self):
+        from harness.tools import format_searx
+        out = format_searx({"results": [{"title": "A", "url": "https://a.io", "content": "mô tả"}, {"title": "B", "url": "https://b.io"}]})
+        self.assertEqual(out, "1. A\n   https://a.io\n   mô tả\n2. B\n   https://b.io")

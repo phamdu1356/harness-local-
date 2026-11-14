@@ -10,7 +10,9 @@ python3 -m harness --local            # tự chạy llama-server với model .gg
 python3 -m harness --local DeepSeek   # chọn model theo một phần tên (hoặc đường dẫn .gguf)
 python3 -m harness --local DeepSeek --cpu --think off   # chạy hoàn toàn bằng CPU, không dùng VRAM
 python3 -m harness -p "giải thích main.py" -C ~/code/dự-án
-python3 -m harness -y                 # tự duyệt thao tác ghi/xoá/bash/web
+python3 -m harness --ask              # hỏi duyệt trước khi ghi/xoá/chạy lệnh (mặc định: TOÀN QUYỀN)
+python3 -m harness --resume           # mở lại phiên gần nhất (hoặc --resume TÊN; lưu thêm bằng --session TÊN)
+python3 -m harness eval --repeat 3    # chạy bộ eval, xem mục Eval bên dưới
 ```
 Tuỳ chọn: `-m`, `--host`, `--temperature`, `--max-steps`, `--system "..."|@file`, `--text-tools`,
 `--cpu --threads 8`, `--embed MODEL`, `--no-embed`, `--local [MODEL] --ctx 16384 --port 8081 --think on|off|auto`. Env: `HARNESS_MODEL`, `LMSTUDIO_HOST`.
@@ -19,9 +21,13 @@ Tuỳ chọn: `-m`, `--host`, `--temperature`, `--max-steps`, `--system "..."|@f
 Log server: `/tmp/harness-llama-server.log`.
 
 ## Tool
-Chỉ đọc (tự chạy): `read_file`, `list_dir`, `glob`, `grep`, `todo`.
-Cần duyệt: `write_file`, `edit_file`, `move_file`, `delete_file`, `bash`, `web_fetch`.
-Mọi đường dẫn bị giới hạn trong workspace. Tham số tool được kiểm tra và tự ép kiểu; lỗi trả về cho model để tự sửa.
+Mặc định agent **toàn quyền**, không hỏi duyệt; dùng `--ask` để hỏi trước các tool ghi/xoá/chạy lệnh/web/MCP.
+`read_file`, `list_dir`, `glob`, `grep`, `todo`, `write_file`, `edit_file`, `move_file`, `delete_file`, `bash`, `web_fetch`, `web_search`, `delegate`.
+Tool file bị giới hạn trong workspace, nhưng **`bash` thì không** (model có thể `cat` file ngoài workspace): đó là hệ quả của toàn quyền.
+- `web_search`: DuckDuckGo (có thể bị chặn truy vấn tự động, khi đó tool báo lỗi rõ). Ổn định hơn: đặt `HARNESS_SEARX_URL` trỏ tới SearXNG của bạn.
+- `delegate`: giao việc khảo sát chỉ-đọc cho subagent có context riêng, chỉ nhận lại kết luận.
+- **MCP**: khai báo server trong `.harness/mcp.json` hoặc `~/.config/harness/mcp.json`
+  (`{"mcpServers": {"tên": {"command": "...", "args": [...], "env": {...}}}}`); tool xuất hiện dạng `tên__tool`. Tham số tool được kiểm tra và tự ép kiểu; lỗi trả về cho model để tự sửa.
 
 ## Bộ nhớ ngoài (RAG nhẹ)
 Tìm lai: SQLite FTS5/BM25 (khớp từ, không phân biệt dấu) + embedding (khớp nghĩa), hợp nhất bằng RRF. Lưu ở `<workspace>/.harness/memory.db` (tự gitignore).
@@ -32,7 +38,18 @@ Tìm lai: SQLite FTS5/BM25 (khớp từ, không phân biệt dấu) + embedding 
 - **Embedding:** tự bật `llama-server --embeddings` bằng CPU với model embedding trong `~/.lmstudio/models` (vd `bge-m3`), không tốn VRAM; ~25 ms/lần tìm. Ngưỡng cosine 0,5 (đo trên bge-m3). Mục chỉ khớp từ khoá phải chứa từ nguyên vẹn đúng dấu. Server embedding lỗi/tắt thì tự rơi về BM25; mục cũ chưa có vector được nhúng bù khi khởi động.
 - Lệnh: `/memory` xem thống kê, `/forget` xoá hết; `--no-memory` để tắt.
 
-## Tối ưu ngữ cảnh
+## Context
+- Đọc **số token thật** từ server (và context đang nạp của LM Studio/llama-server), học tỉ lệ ký tự/token để tính ngân sách (65% context dành cho hội thoại). `/context` xem chi tiết; chân mỗi lượt hiện `ctx 2.0k/63.5k`.
+- Khi vượt ngân sách: lược kết quả tool cũ → đẩy cả lượt cũ ra, **tóm tắt bằng chính model** vào prompt hệ thống (`--no-summary` để tắt). Nội dung gốc vẫn nằm trong bộ nhớ ngoài.
+- Server báo tràn context thì tự siết ngân sách và thử lại một lần.
+- Phiên tự lưu vào `.harness/sessions/last.json` sau mỗi lượt.
+
+## Eval
+`python3 -m harness eval [--task TÊN] [--repeat N] [--label NHÃN] [--compare FILE.json] [--list]` (dùng chung cờ model/`--effort`/`--cpu`...).
+9 tình huống: sửa lỗi, tìm định nghĩa, tạo file, sửa chính xác, đổi tên nhiều file, sửa cho test pass, nhớ sau khi bị đẩy khỏi context, không bịa file, đếm nơi gọi.
+Chấm tự động (chạy code/so nội dung), lưu `.harness/evals/*.json`, `--compare` so với lần trước. Mã thoát 0 nếu đạt hết.
+
+## Tối ưu ngữ cảnh (cũ)
 - Kết quả tool cũ được lược khi ngữ cảnh vượt ngân sách (giữ 6 tin gần nhất).
 - Chặn vòng lặp: gọi y hệt lần 3 thì cảnh báo, lần 4 thì từ chối.
 - `HARNESS.md` / `AGENTS.md` / `CLAUDE.md` ở gốc workspace tự được nạp vào prompt hệ thống.
