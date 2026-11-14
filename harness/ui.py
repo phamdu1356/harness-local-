@@ -72,7 +72,7 @@ class UI:
         self.w(f"{self.c('accent', '│')} {self.c('bold', 'harness')} {self.c('muted', 'agent cho LLM local')}")
         self.w(f"{self.c('accent', '│')} {self.c('muted', 'model')} {model}")
         self.w(f"{self.c('accent', '│')} {self.c('muted', 'thư mục')} {cwd}")
-        self.w(f"{self.c('accent', '│')} {self.c('dim', '/clear xoá hội thoại · /exit thoát · Ctrl+C ngắt')}")
+        self.w(f"{self.c('accent', '│')} {self.c('dim', '/clear · /memory · /forget · /exit · Ctrl+C ngắt')}")
         self.w(self.c("accent", f"╰{line}"))
 
     def prompt(self) -> str:
@@ -123,6 +123,10 @@ class UI:
         detail = args.get("command") or args.get("path") or json.dumps(args, ensure_ascii=False)
         self.end_stream()
         return f"{self.c('warn', '⚠')} cho phép {self.c('bold', name)} {self.c('muted', clip(str(detail), 120))} {self.c('dim', '[y/N]')} "
+
+    def memory_note(self, n: int):
+        self.end_stream()
+        self.w(self.c("muted", f"◌ nhớ lại {n} mục từ bộ nhớ ngoài"))
 
     def footer(self, seconds: float, steps: int):
         self.w(self.c("dim", f"  ⏱ {seconds:.1f}s · {steps} lượt"))
