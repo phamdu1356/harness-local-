@@ -1,6 +1,7 @@
 """Các tool cho agent: schema (kiểu OpenAI) + hàm thực thi + kiểm tra tham số."""
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import html
 import json
@@ -14,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from . import sandbox as _sandbox
+
 MAX_OUTPUT = 8000
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
 
@@ -23,6 +26,23 @@ def clip(text: str, limit: int = MAX_OUTPUT) -> str:
         return text
     half = limit // 2
     return f"{text[:half]}\n... [cắt {len(text) - limit} ký tự] ...\n{text[-half:]}"
+
+
+def closest_block(text: str, old: str, context: int = 1) -> str:
+    """Đoạn trong text giống `old` nhất (theo dòng), kèm số dòng; rỗng nếu không có gì đủ giống."""
+    lines, want = text.splitlines(), old.splitlines() or [old]
+    n = len(want)
+    if not lines:
+        return ""
+    best, best_i = 0.0, 0
+    for i in range(max(1, len(lines) - n + 1)):
+        r = difflib.SequenceMatcher(None, "\n".join(lines[i:i + n]), "\n".join(want)).ratio()
+        if r > best:
+            best, best_i = r, i
+    if best < 0.6:
+        return ""
+    lo, hi = max(0, best_i - context), min(len(lines), best_i + n + context)
+    return "\n".join(f"{j + 1}\t{lines[j]}" for j in range(lo, hi))
 
 
 def P(type_: str, desc: str, optional: bool = False) -> dict:
@@ -115,13 +135,19 @@ def _walk(base: Path):
             yield Path(dirpath) / f
 
 
-def build_tools(ws: Workspace, bash_timeout: int = 60) -> dict[str, Tool]:
+def build_tools(ws: Workspace, bash_timeout: int = 60, sandbox: bool = True) -> dict[str, Tool]:
     todo_state: list[str] = []
+    seen_state: dict[str, tuple[int, int]] = {}  # file -> (mtime_ns, size) tại lần model đọc/ghi gần nhất
+
+    def mark(p: Path) -> None:
+        st = p.stat()
+        seen_state[str(p)] = (st.st_mtime_ns, st.st_size)
 
     def read_file(path: str, offset: int = 1, limit: int = 400) -> str:
         p = ws.path(path)
         if p.stat().st_size > 2_000_000:
             return "LỖI: file quá lớn (>2MB). Dùng grep hoặc bash (head/sed)."
+        mark(p)
         lines = p.read_text(errors="replace").splitlines()
         offset = max(offset, 1)
         chunk = lines[offset - 1: offset - 1 + limit]
@@ -134,6 +160,7 @@ def build_tools(ws: Workspace, bash_timeout: int = 60) -> dict[str, Tool]:
         p.parent.mkdir(parents=True, exist_ok=True)
         existed = p.exists()
         p.write_text(content)
+        mark(p)
         return f"Đã {'ghi đè' if existed else 'tạo'} {path} ({len(content.splitlines())} dòng)"
 
     def edit_file(path: str, old: str, new: str) -> str:
@@ -141,10 +168,18 @@ def build_tools(ws: Workspace, bash_timeout: int = 60) -> dict[str, Tool]:
         text = p.read_text()
         n = text.count(old)
         if n == 0:
-            return "LỖI: không tìm thấy `old` (phải khớp chính xác, kể cả khoảng trắng). Đọc lại file bằng read_file."
+            hint = closest_block(text, old)
+            st = p.stat()
+            stale = str(p) in seen_state and seen_state[str(p)] != (st.st_mtime_ns, st.st_size)
+            return ("LỖI: không tìm thấy `old` (phải khớp chính xác, kể cả khoảng trắng và thụt lề)."
+                    + ("\nLƯU Ý: file này ĐÃ THAY ĐỔI kể từ lần bạn đọc/ghi gần nhất (có thể do lệnh bash/sed của bạn), "
+                       "nên bản bạn đang nhớ đã cũ. Hãy read_file lại rồi mới sửa." if stale else "")
+                    + (f"\nĐoạn gần giống nhất trong file (số dòng\tnội dung):\n{hint}\nChép đúng nội dung thật ở trên vào `old`."
+                       if hint else " Đọc lại file bằng read_file."))
         if n > 1:
             return f"LỖI: `old` xuất hiện {n} lần, thêm ngữ cảnh để duy nhất."
         p.write_text(text.replace(old, new, 1))
+        mark(p)
         return f"Đã sửa {path}"
 
     def list_dir(path: str = ".") -> str:
@@ -192,12 +227,23 @@ def build_tools(ws: Workspace, bash_timeout: int = 60) -> dict[str, Tool]:
         return f"Đã xoá {path}"
 
     def bash(command: str) -> str:
+        env = {**os.environ, "PAGER": "cat"}
+        if sandbox:
+            if not _sandbox.available():  # đóng kín: không sandbox được thì không chạy
+                return ("LỖI: không dựng được sandbox (kernel thiếu Landlock) nên bash bị tắt để giữ giới hạn "
+                        "thư mục. Chạy với --no-sandbox nếu chấp nhận rủi ro.")
+            argv, shell = _sandbox.wrap(command, ws.root), False
+        else:
+            argv, shell = command, True
         try:
-            r = subprocess.run(command, shell=True, cwd=ws.root, capture_output=True, text=True,
-                               timeout=bash_timeout, stdin=subprocess.DEVNULL, env={**os.environ, "PAGER": "cat"})
+            r = subprocess.run(argv, shell=shell, cwd=ws.root, capture_output=True, text=True,
+                               timeout=bash_timeout, stdin=subprocess.DEVNULL, env=env)
         except subprocess.TimeoutExpired:
             return f"LỖI: quá {bash_timeout}s, đã dừng."
         out = (r.stdout + (f"\n[stderr]\n{r.stderr}" if r.stderr else "")).strip()
+        if sandbox and re.search(r"Permission denied|Không đủ quyền|Operation not permitted", out):
+            out += ("\n[sandbox] Bạn chỉ truy cập được bên trong thư mục workspace (đây cũng là thư mục hiện tại của "
+                    "bash). Dùng đường dẫn TƯƠNG ĐỐI như `src/a.py` hoặc `.`, đừng dùng đường dẫn tuyệt đối hay cd ra ngoài.")
         return clip(f"{out}\n[exit {r.returncode}]")
 
     def web_fetch(url: str) -> str:
@@ -269,9 +315,12 @@ def build_tools(ws: Workspace, bash_timeout: int = 60) -> dict[str, Tool]:
         Tool("move_file", "Đổi tên/di chuyển file hoặc thư mục.",
              {"src": P(S, "nguồn"), "dst": P(S, "đích")}, move_file, True),
         Tool("delete_file", "Xoá file hoặc thư mục.", {"path": P(S, "đường dẫn")}, delete_file, True),
-        Tool("bash", "Chạy lệnh shell trong workspace (không tương tác, timeout 60s).",
+        Tool("bash", "Chạy lệnh shell trong workspace (không tương tác, timeout 60s). Bị nhốt trong thư mục workspace: không đọc/ghi được gì ngoài đó.",
              {"command": P(S, "lệnh shell")}, bash, True),
         Tool("web_fetch", "Tải một trang web và trả về văn bản thuần.",
              {"url": P(S, "URL http(s)")}, web_fetch, True),
     ]
+    for t in tools:
+        if t.name == "todo":
+            t.state = todo_state   # để chế độ --goal đọc/ghi kế hoạch
     return {t.name: t for t in tools}

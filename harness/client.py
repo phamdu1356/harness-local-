@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -15,10 +16,29 @@ class Reply:
     tool_calls: list[dict] = field(default_factory=list)  # [{"id", "name", "arguments"(dict)}]
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    aborted: str = ""   # "repetition" | "too_long": luồng bị ngắt giữa chừng vì model lặp/lan man
 
 
 class LLMError(RuntimeError):
     pass
+
+
+MAX_THINK_CHARS = 14000
+_SEG_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def detect_repetition(text: str, repeats: int = 3) -> bool:
+    """Một khối 1–4 câu (tổng ≥20 ký tự) lặp liên tiếp `repeats` lần ở cuối văn bản: vòng lặp suy nghĩ của model."""
+    segs = [x.strip() for x in _SEG_SPLIT.split(text[-3000:]) if x.strip()]
+    for p in range(1, 5):
+        if len(segs) < p * repeats:
+            break
+        block = segs[-p:]
+        if sum(len(x) for x in block) < 20:
+            continue
+        if all(segs[len(segs) - (k + 1) * p: len(segs) - k * p] == block for k in range(1, repeats)):
+            return True
+    return False
 
 
 class LMStudioClient:
@@ -68,7 +88,7 @@ class LMStudioClient:
         req = urllib.request.Request(
             f"{self.host}/v1/chat/completions", data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
-        reply, partial = Reply(), {}  # partial: index -> {id, name, args(str)}
+        reply, partial, checked = Reply(), {}, 0  # partial: index -> {id, name, args(str)}
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 for raw in resp:
@@ -100,6 +120,15 @@ class LMStudioClient:
                             fn = tc.get("function", {})
                             p["name"] += fn.get("name") or ""
                             p["args"] += fn.get("arguments") or ""
+                    seen = len(reply.thinking) + len(reply.content)
+                    if seen - checked >= 200:     # kiểm tra mỗi ~200 ký tự mới, không phải từng chunk
+                        checked = seen
+                        if detect_repetition(reply.thinking) or detect_repetition(reply.content):
+                            reply.aborted = "repetition"
+                        elif len(reply.thinking) > MAX_THINK_CHARS and not reply.content and not partial:
+                            reply.aborted = "too_long"
+                    if reply.aborted:
+                        break
         except urllib.error.HTTPError as e:
             raise LLMError(f"HTTP {e.code}: {e.read().decode(errors='replace')}") from e
         except urllib.error.URLError as e:

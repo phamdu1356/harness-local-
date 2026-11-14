@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import re
 import sys
 import uuid
 
@@ -16,7 +17,7 @@ from .tools import Workspace, build_tools
 from .ui import UI
 
 DEFAULT_CTX = 16384
-CTX_USABLE = 0.65  # phần context dành cho hội thoại; còn lại để model suy nghĩ và trả lời
+CTX_USABLE = 0.5   # phần context dành cho hội thoại; context nhỏ => mỗi bước nhanh hơn rõ rệt, phần cũ đã có bộ nhớ ngoài
 
 
 def common_parser() -> argparse.ArgumentParser:
@@ -42,6 +43,10 @@ def common_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-embed", action="store_true", help="không dùng embedding (chỉ tìm theo từ khoá BM25)")
     ap.add_argument("--no-memory", action="store_true", help="tắt bộ nhớ ngoài")
     ap.add_argument("--no-summary", action="store_true", help="không tóm tắt hội thoại cũ khi đẩy ra khỏi context")
+    ap.add_argument("--no-sandbox", action="store_true", help="KHÔNG nhốt bash trong workspace (nguy hiểm)")
+    ap.add_argument("--verify", metavar="LỆNH", help="lệnh kiểm tra tự động chạy khi agent báo xong (vd: 'python3 -m unittest'); "
+                    "thất bại thì agent phải sửa tiếp, không cho báo xong")
+    ap.add_argument("--verify-rounds", type=int, default=3, help="số vòng sửa tối đa sau khi kiểm tra thất bại")
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--max-steps", type=int, default=25)
     return ap
@@ -89,12 +94,18 @@ def make_client(a) -> tuple[LMStudioClient, int]:
 
 def make_agent(a, client, ctx: int, ws: Workspace, ui: UI, memory: Memory | None, extra: str = "",
                mcp: bool = True) -> tuple[Agent, list]:
-    tools = build_tools(ws)
+    tools = build_tools(ws, sandbox=not getattr(a, "no_sandbox", False))
     servers = []
     if mcp:
         mcp_tools, servers = load_mcp_tools(ws.root, warn=lambda m: ui.w(ui.c("warn", m)))
         tools.update(mcp_tools)
+    def verify():
+        out = tools["bash"].fn(a.verify)
+        m = re.search(r"\[exit (\d+)\]\s*$", out)
+        return bool(m and m.group(1) == "0"), out
+
     agent = Agent(client, tools, ws, ui=ui, memory=memory, effort=a.effort, text_tools=a.text_tools,
+                  verify=verify if getattr(a, "verify", None) else None, verify_rounds=getattr(a, "verify_rounds", 3),
                   system_extra=extra, max_steps=a.max_steps, summarize=not a.no_summary,
                   max_context_tokens=int(ctx * CTX_USABLE), ctx_total=ctx,
                   auto_approve=not getattr(a, "ask", False))
@@ -118,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ask", action="store_true", help="hỏi duyệt trước khi ghi/xoá/chạy lệnh (mặc định: toàn quyền)")
     ap.add_argument("-y", "--yes", action="store_true", help=argparse.SUPPRESS)  # giữ cho tương thích
     ap.add_argument("--system", help="prompt bổ sung (văn bản, hoặc @đường/dẫn/file)")
+    ap.add_argument("--goal", help="mục tiêu lớn: agent tự lập kế hoạch, harness giao từng việc nhỏ với ngân sách bước riêng")
+    ap.add_argument("--step-budget", type=int, default=30, help="số bước tối đa cho MỖI việc trong --goal")
+    ap.add_argument("--max-items", type=int, default=10, help="số việc tối đa trong --goal")
+    ap.add_argument("--no-require-tests", action="store_true", help="--goal: không đòi test đi kèm khi đổi mã")
     ap.add_argument("--resume", nargs="?", const="last", metavar="TÊN", help="mở lại phiên đã lưu (mặc định: phiên gần nhất)")
     ap.add_argument("--session", metavar="TÊN", help="lưu phiên này thêm dưới tên TÊN")
     a = ap.parse_args(argv)
@@ -150,6 +165,12 @@ def run(a) -> int:
                 ui.w(ui.c("muted", f"◌ đã mở lại phiên '{a.resume}' ({agent.turn} lượt)"))
             else:
                 ui.error(f"không tìm thấy phiên '{a.resume}' trong {sess_dir}")
+        if a.goal:
+            from .goal import report, run_goal
+            results = run_goal(agent, a.goal, a.step_budget, a.max_items, require_tests=not a.no_require_tests)
+            save()
+            ui.w("\n" + report(results))
+            return 0 if results and all(r.status == "done" for r in results) else 2
         if a.prompt:
             agent.run(a.prompt)
             save()

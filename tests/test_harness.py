@@ -1,4 +1,6 @@
 import io
+import json
+from pathlib import Path
 import tempfile
 import unittest
 
@@ -428,3 +430,552 @@ class SearchBackendTests(unittest.TestCase):
         from harness.tools import format_searx
         out = format_searx({"results": [{"title": "A", "url": "https://a.io", "content": "mô tả"}, {"title": "B", "url": "https://b.io"}]})
         self.assertEqual(out, "1. A\n   https://a.io\n   mô tả\n2. B\n   https://b.io")
+
+
+@unittest.skipUnless(__import__("harness.sandbox", fromlist=["x"]).available(), "kernel không có Landlock")
+class SandboxTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory()
+        self.ws = Workspace(self.d.name)
+        self.bash = build_tools(self.ws)["bash"].fn
+
+    def test_works_inside_workspace(self):
+        out = self.bash("mkdir sub && echo xin chào > sub/f.txt && cat sub/f.txt && python3 -c 'print(6*7)'")
+        self.assertIn("xin chào", out)
+        self.assertIn("42", out)
+        self.assertTrue((self.ws.root / "sub" / "f.txt").exists())
+
+    def test_cannot_read_outside(self):
+        self.assertNotIn("root:", self.bash("cat /etc/passwd"))
+        self.assertIn("denied", self.bash("ls /home").lower().replace("permission denied", "denied"))
+        self.assertNotIn("root:", self.bash("ln -s /etc/passwd lk && cat lk"))  # đường vòng qua symlink
+
+    def test_cannot_write_outside(self):
+        marker = self.ws.root.parent / "harness-escape-marker.txt"
+        self.bash(f"echo x > {marker}")
+        self.bash("echo x > ../harness-escape-marker2.txt")
+        self.bash("echo x > /tmp/harness-escape-marker3.txt")
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.ws.root.parent / "harness-escape-marker2.txt").exists())
+        self.assertFalse(Path("/tmp/harness-escape-marker3.txt").exists())
+
+    def test_cannot_cd_out(self):
+        self.assertIn("denied", self.bash("cd .. && ls").lower())
+
+    def test_fail_closed_when_unavailable(self):
+        import harness.tools as T
+        real = T._sandbox.available
+        T._sandbox.available = lambda: False
+        try:
+            out = build_tools(self.ws)["bash"].fn("echo hi")
+        finally:
+            T._sandbox.available = real
+        self.assertIn("LỖI", out)
+        self.assertNotIn("hi\n", out)
+        self.assertEqual(build_tools(self.ws, sandbox=False)["bash"].fn("echo hi").split()[0], "hi")
+
+
+@unittest.skipUnless(__import__("harness.sandbox", fromlist=["x"]).available(), "kernel không có Landlock")
+class SandboxHintTests(unittest.TestCase):
+    def test_denied_output_explains_and_prompt_says_relative(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        out = build_tools(ws)["bash"].fn("cat /etc/passwd")
+        self.assertIn("[sandbox]", out)
+        self.assertIn("TƯƠNG ĐỐI", out)
+        self.assertNotIn("[sandbox]", build_tools(ws)["bash"].fn("echo ok"))
+        a = Agent(FakeClient([]), build_tools(ws), ws, ui=UI(io.StringIO()))
+        self.assertIn("đường dẫn TƯƠNG ĐỐI", a.messages[0]["content"])
+
+
+class PromptHidesAbsolutePathTest(unittest.TestCase):
+    def test_no_absolute_root_in_system_prompt(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        sys_prompt = Agent(FakeClient([]), build_tools(ws), ws, ui=UI(io.StringIO())).messages[0]["content"]
+        self.assertNotIn(str(ws.root), sys_prompt)   # model hay gõ sai đường dẫn tuyệt đối
+        self.assertIn("thư mục hiện tại", sys_prompt)
+
+
+class LongTurnCompactionTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory(); self.ws = Workspace(self.d.name)
+
+    def agent(self, **kw):
+        return Agent(SmartClient([]), build_tools(self.ws), self.ws, ui=UI(io.StringIO()), **kw)
+
+    def test_over_budget_keeps_only_current_turn(self):
+        a = self.agent(summarize=True, max_context_chars=900)
+        a.messages += [{"role": "user", "content": "câu cũ " + "x" * 600, "_turn": 1}, {"role": "assistant", "content": "y" * 600},
+                       {"role": "user", "content": "câu mới", "_turn": 2}, {"role": "assistant", "content": "ok"}]
+        a.compact()
+        self.assertEqual([m["_turn"] for m in a.messages if "_turn" in m], [2])  # trước đây luôn giữ 2 lượt nên không dọn được
+
+    def test_single_long_turn_drops_old_steps_keeps_pairs(self):
+        a = self.agent(summarize=True, max_context_chars=3000)
+        a.turn = 1
+        a.messages.append({"role": "user", "content": "làm app", "_turn": 1})
+        for i in range(12):
+            a.messages.append({"role": "assistant", "content": "", "tool_calls": [{"id": str(i), "type": "function",
+                               "function": {"name": "read_file", "arguments": "{}"}}]})
+            a.messages.append({"role": "tool", "tool_call_id": str(i), "content": f"kết quả {i} " + "z" * 700})
+        before = len(a.messages)
+        a.compact()
+        self.assertLess(len(a.messages), before)
+        self.assertEqual(a.messages[1]["content"], "làm app")               # tin nhắn của lượt được giữ
+        self.assertEqual(a.messages[2]["role"], "assistant")                # không bắt đầu bằng tool mồ côi
+        for i, m in enumerate(a.messages):
+            if m["role"] == "tool":
+                self.assertEqual(a.messages[i - 1]["role"] in ("assistant", "tool"), True)
+        self.assertIn("kết quả 11", a.messages[-1]["content"])              # bước mới nhất còn nguyên
+
+
+class VerifyGateTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory(); self.ws = Workspace(self.d.name)
+
+    def test_cannot_finish_until_verify_passes(self):
+        results, calls = [(False, "FAILED: 1 test"), (True, "OK")], []
+        def verify():
+            calls.append(1)
+            return results.pop(0)
+        out = io.StringIO()
+        a = Agent(SmartClient([Reply(content="xong"), Reply(content="đã sửa")]), build_tools(self.ws), self.ws,
+                  ui=UI(out), verify=verify)
+        self.assertEqual(a.run("làm"), "đã sửa")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(any("[Kiểm tra tự động]" in (m.get("content") or "") and "FAILED" in m["content"] for m in a.messages))
+        self.assertIn("đạt", out.getvalue())
+
+    def test_gives_up_honestly_after_rounds(self):
+        out = io.StringIO()
+        a = Agent(SmartClient([Reply(content="xong")] * 5), build_tools(self.ws), self.ws, ui=UI(out),
+                  verify=lambda: (False, "vẫn lỗi"), verify_rounds=2)
+        a.run("làm")
+        self.assertIn("VẪN thất bại", out.getvalue())
+
+
+class EditHintTests(unittest.TestCase):
+    def test_hint_shows_closest_block(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        t = build_tools(ws)
+        t["write_file"].fn("c.py", "def add(a, b):\n    return a - b\n\nprint(add(1, 2))\n")
+        out = t["edit_file"].fn("c.py", "  return a -b", "  return a + b")
+        self.assertIn("2\t    return a - b", out)       # chép lại đúng dòng thật, có số dòng
+        self.assertIn("không tìm thấy", t["edit_file"].fn("c.py", "hoàn toàn khác biệt xyz 123", "q"))
+
+
+class ToolCallArgsCountedTests(unittest.TestCase):
+    def test_write_file_args_count_and_shrink(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([]), build_tools(ws), ws, ui=UI(io.StringIO()), max_context_chars=2500)
+        big = json.dumps({"path": "db.py", "content": "x = 1\n" * 400})
+        a.messages.append({"role": "user", "content": "viết db", "_turn": 1})
+        for i in range(8):
+            a.messages.append({"role": "assistant", "content": "", "tool_calls": [{"id": str(i), "type": "function",
+                               "function": {"name": "write_file", "arguments": big}}]})
+            a.messages.append({"role": "tool", "tool_call_id": str(i), "content": "Đã tạo db.py"})
+        self.assertGreater(a._size(), 16000)          # trước đây coi là ~100 ký tự
+        a.compact()
+        self.assertLess(a._size(), 11000)   # 6 tin gần nhất được giữ nguyên, phần cũ hơn đã lược
+        self.assertIn("x = 1", a.messages[-2]["tool_calls"][0]["function"]["arguments"])  # bước mới nhất còn đủ nội dung
+        old = json.loads(a.messages[2]["tool_calls"][0]["function"]["arguments"])   # vẫn là JSON hợp lệ
+        self.assertIn("đã lược", old["content"])
+        self.assertEqual(old["path"], "db.py")
+
+
+class StaleFileAndNudgeTests(unittest.TestCase):
+    def test_stale_file_hint(self):
+        import os, time
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name); t = build_tools(ws)
+        t["write_file"].fn("a.py", "x = 1\ny = 2\n")
+        t["read_file"].fn("a.py")
+        (ws.root / "a.py").write_text("x = 100\ny = 2\nz = 3\n")      # file bị đổi bởi nơi khác (vd bash sed)
+        os.utime(ws.root / "a.py", (time.time() + 5, time.time() + 5))
+        out = t["edit_file"].fn("a.py", "x = 1\n", "x = 9\n")
+        self.assertIn("ĐÃ THAY ĐỔI", out)
+        t["read_file"].fn("a.py")                                      # đọc lại thì không còn cảnh báo thừa
+        self.assertNotIn("ĐÃ THAY ĐỔI", t["edit_file"].fn("a.py", "không có đoạn này", "q"))
+        t["edit_file"].fn("a.py", "x = 100", "x = 7")                   # tự sửa của mình không bị coi là đã đổi
+        self.assertNotIn("ĐÃ THAY ĐỔI", t["edit_file"].fn("a.py", "không có đoạn này", "q"))
+
+    def test_nudge_todo_and_python_c(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([]), build_tools(ws), ws, ui=UI(io.StringIO()))
+        st = {"nudged": 0, "todo": 0}
+        self.assertIn("todo", a._nudge([], 25, st))
+        self.assertEqual(a._nudge([], 30, st), "")                      # không nhắc dồn dập (cách ít nhất 12 bước)
+        hist = [("bash", {"command": "python3 -c 'print(1)'"})] * 8
+        st2 = {"nudged": 0, "todo": 30}
+        self.assertIn("read_file", a._nudge(hist, 31, st2))
+        self.assertEqual(a._nudge([("read_file", {})] * 8, 60, {"nudged": 0, "todo": 55, "edit": 50}), "")
+        self.assertIn("chưa sửa được file nào", a._nudge([("read_file", {})] * 8, 60, {"nudged": 0, "todo": 55, "edit": 20}))
+
+
+class GoalModeTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory(); self.ws = Workspace(self.d.name)
+
+    def agent(self, script, **kw):
+        a = Agent(SmartClient(script), build_tools(self.ws), self.ws, ui=UI(io.StringIO()), **kw)
+        return a
+
+    def todo(self, text):
+        return Reply(tool_calls=[{"id": "t", "name": "todo", "arguments": {"todos": text}}])
+
+    def test_parse_plan(self):
+        from harness.goal import parse_plan
+        self.assertEqual(parse_plan(["[ ] a", "[x] b", "rác", "[!] c (bị chặn)"]), [(" ", "a"), ("x", "b"), ("!", "c (bị chặn)")])
+
+    def test_runs_items_one_by_one(self):
+        from harness.goal import run_goal
+        a = self.agent([self.todo("[ ] làm A\n[ ] làm B"), Reply(content="đã lập kế hoạch"),   # giai đoạn lập kế hoạch
+                        self.todo("[x] làm A\n[ ] làm B"), Reply(content="xong A"),             # việc 1: tự đánh [x]
+                        Reply(content="xong B")])                                              # việc 2: kết thúc tự nhiên
+        res = run_goal(a, "mục tiêu", step_budget=5, require_change=False)
+        self.assertEqual([(r.index, r.status) for r in res], [(1, "done"), (2, "done")])
+        self.assertTrue(all(line.startswith("[x]") for line in a.tools["todo"].state))
+        self.assertEqual(a.max_steps, 25)   # ngân sách bước gốc được khôi phục
+
+    def test_blocked_item_moves_on(self):
+        from harness.goal import report, run_goal
+        loop = [Reply(tool_calls=[{"id": str(i), "name": "list_dir", "arguments": {"path": "."}}]) for i in range(3)]
+        a = self.agent([self.todo("[ ] việc khó\n[ ] việc dễ"), Reply(content="kế hoạch xong")]
+                       + loop + [Reply(content="xong việc dễ")])
+        res = run_goal(a, "mục tiêu", step_budget=3, plan_steps=5, require_change=False)
+        self.assertEqual([r.status for r in res], ["blocked", "done"])   # hết bước ở việc 1 thì sang việc 2
+        self.assertIn("[!] việc khó (bị chặn", a.tools["todo"].state[0])
+        self.assertIn("1/2", report(res))
+
+    def test_no_plan_is_reported(self):
+        from harness.goal import run_goal
+        a = self.agent([Reply(content="không làm gì")])
+        self.assertEqual(run_goal(a, "x", step_budget=3, plan_steps=2, require_change=False), [])
+
+
+class VerifyBaselineAndAdviceTests(unittest.TestCase):
+    def test_fingerprint_and_regression(self):
+        from harness.agent import _no_regression, fingerprint
+        out1 = "FAIL: test_a (m.T.test_a)\nERROR: test_b (m.T.test_b)\nFAILED (failures=1, errors=1)"
+        out2 = "FAIL: test_a (m.T.test_a)\nFAILED (failures=1)"
+        out3 = "FAIL: test_c (m.T.test_c)\nFAILED (failures=1)"
+        self.assertTrue(_no_regression(fingerprint(out2), fingerprint(out1)))    # ít lỗi hơn: không hồi quy
+        self.assertFalse(_no_regression(fingerprint(out3), fingerprint(out1)))   # lỗi mới: hồi quy
+        self.assertFalse(_no_regression(fingerprint(out1), None))
+
+    def test_known_failure_does_not_block_and_new_one_does(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([Reply(content="xong")]), build_tools(ws), ws, ui=UI(io.StringIO()),
+                  verify=lambda: (False, "FAIL: test_cu (m.T.test_cu)\nFAILED (failures=1)"))
+        a.verify_baseline = frozenset({"test_cu (m.T.test_cu)"})
+        self.assertEqual(a.run("việc"), "xong")                                  # không bị ép sửa lỗi cũ
+        self.assertFalse(any("[Kiểm tra tự động]" in (m.get("content") or "") for m in a.messages))
+        b = Agent(SmartClient([Reply(content="xong"), Reply(content="sửa rồi")]), build_tools(ws), ws,
+                  ui=UI(io.StringIO()), verify_rounds=1,
+                  verify=lambda: (False, "FAIL: test_moi (m.T.test_moi)\nFAILED (failures=1)"))
+        b.verify_baseline = frozenset({"test_cu (m.T.test_cu)"})
+        b.run("việc")
+        self.assertTrue(any("[Kiểm tra tự động]" in (m.get("content") or "") for m in b.messages))  # lỗi mới thì chặn
+
+    def test_repeat_failure_gets_advice(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([Reply(content="xong")] * 4), build_tools(ws), ws, ui=UI(io.StringIO()),
+                  verify=lambda: (False, "FAIL: test_x (m.T.test_x)\nFAILED (failures=1)"), verify_rounds=3)
+        a.run("việc")
+        msgs = [m["content"] for m in a.messages if "[Kiểm tra tự động]" in (m.get("content") or "")]
+        self.assertNotIn("GIỐNG HỆT", msgs[0])      # lần đầu chưa gợi ý
+        self.assertIn("GIỐNG HỆT", msgs[1])         # lặp lại thì gợi ý xét chính test
+        self.assertIn("ngày giờ cố định", msgs[1])
+
+
+class HysteresisTests(unittest.TestCase):
+    def test_compacts_once_then_stays_stable(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([]), build_tools(ws), ws, ui=UI(io.StringIO()), max_context_chars=4000)
+        a.turn = 1
+        a.messages.append({"role": "user", "content": "làm", "_turn": 1})
+        for i in range(10):
+            a.messages.append({"role": "assistant", "content": "", "tool_calls": [{"id": str(i), "type": "function",
+                               "function": {"name": "read_file", "arguments": "{}"}}]})
+            a.messages.append({"role": "tool", "tool_call_id": str(i), "content": f"r{i} " + "z" * 450})
+        self.assertGreater(a._size(), 4000)
+        a.compact()
+        self.assertLessEqual(a._size(), 2800)           # tụt xuống ~70% ngân sách, không chỉ vừa đủ dưới trần
+        snapshot = json.dumps(a.messages, sort_keys=True)
+        for _ in range(3):                              # các bước sau: không đổi gì => giữ được cache tiền tố của server
+            a.messages.append({"role": "assistant", "content": "ok"})
+            a.compact()
+        self.assertTrue(json.dumps(a.messages[:-3], sort_keys=True) == snapshot)
+
+
+class ExhaustedFlagTests(unittest.TestCase):
+    def test_flag_distinguishes_budget_from_natural_end(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        loop = [Reply(tool_calls=[{"id": str(i), "name": "list_dir", "arguments": {"path": "."}}]) for i in range(3)]
+        a = Agent(SmartClient(loop), build_tools(ws), ws, ui=UI(io.StringIO()), max_steps=3)
+        a.run("x")
+        self.assertTrue(a.exhausted)
+        b = Agent(SmartClient([Reply(content="")] * 3), build_tools(ws), ws, ui=UI(io.StringIO()))
+        b.run("x")                                       # kết thúc tự nhiên nhưng câu trả lời cuối RỖNG
+        self.assertFalse(b.exhausted)
+
+
+class GoalPlanOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory(); self.ws = Workspace(self.d.name)
+
+    def agent(self, script):
+        return Agent(SmartClient(script), build_tools(self.ws), self.ws, ui=UI(io.StringIO()))
+
+    def todo(self, text):
+        return Reply(tool_calls=[{"id": "t", "name": "todo", "arguments": {"todos": text}}])
+
+    def test_model_rewriting_todo_cannot_resurrect_or_shift_items(self):
+        from harness.goal import run_goal
+        loop = [Reply(tool_calls=[{"id": str(i), "name": "list_dir", "arguments": {"path": str(i)}}]) for i in range(3)]
+        a = self.agent([self.todo("[ ] việc A\n[ ] việc A\n[ ] việc B"), Reply(content="kế hoạch"),   # có việc trùng
+                        self.todo("[ ] việc A mới toanh\n[ ] việc Z"),                                   # model viết lại cả danh sách
+                        *loop,                                                                           # việc A: hết bước
+                        Reply(content="xong B")])
+        res = run_goal(a, "mục tiêu", step_budget=4, plan_steps=5, require_change=False)
+        self.assertEqual([(r.index, r.text, r.status) for r in res], [(1, "việc A", "blocked"), (2, "việc B", "done")])
+        self.assertEqual(a.tools["todo"].state, ["[!] việc A (bị chặn: hết 4 bước)", "[x] việc B"])   # kế hoạch chuẩn
+
+    def test_empty_final_answer_is_not_blocked(self):
+        from harness.goal import run_goal
+        a = self.agent([self.todo("[ ] việc A"), Reply(content="kế hoạch"), Reply(content=""), Reply(content=""), Reply(content="")])
+        self.assertEqual([r.status for r in run_goal(a, "mục tiêu", step_budget=4, plan_steps=5, require_change=False)], ["done"])
+
+    def test_planning_phase_is_read_only(self):
+        from harness.goal import run_goal
+        a = self.agent([Reply(tool_calls=[{"id": "w", "name": "write_file", "arguments": {"path": "x.py", "content": "1"}}]),
+                        self.todo("[ ] việc A"), Reply(content="kế hoạch"), Reply(content="xong")])
+        run_goal(a, "mục tiêu", step_budget=4, plan_steps=6, require_change=False)
+        self.assertFalse((self.ws.root / "x.py").exists())          # không ghi được khi đang lập kế hoạch
+        self.assertIn("write_file", a.tools)                        # công cụ đầy đủ được khôi phục sau đó
+
+
+class GoalGuardsTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory(); self.ws = Workspace(self.d.name)
+
+    def agent(self, script, **kw):
+        return Agent(SmartClient(script), build_tools(self.ws), self.ws, ui=UI(io.StringIO()), **kw)
+
+    def todo(self, text):
+        return Reply(tool_calls=[{"id": "t", "name": "todo", "arguments": {"todos": text}}])
+
+    def write(self, path, content="x = 1\n"):
+        return Reply(tool_calls=[{"id": "w" + path, "name": "write_file", "arguments": {"path": path, "content": content}}])
+
+    def test_claiming_done_without_changing_files_is_not_done(self):
+        from harness.goal import run_goal
+        # báo xong -> bị yêu cầu bổ sung 2 lần -> vẫn không đổi gì -> bị chặn
+        a = self.agent([self.todo("[ ] làm A"), Reply(content="kế hoạch"), Reply(content="đã xong hết"),
+                        Reply(content="vẫn xong"), Reply(content="thật sự xong")])
+        res = run_goal(a, "mục tiêu", step_budget=4, plan_steps=5)
+        self.assertEqual([r.status for r in res], ["blocked"])
+        self.assertIn("CHƯA thay đổi file nào", res[0].note)
+        self.assertEqual(sum("CHƯA đạt" in (m.get("content") or "") for m in a.messages), 2)   # có đúng 2 lần bổ sung
+
+    def test_code_without_test_gets_a_second_chance_then_passes(self):
+        from harness.goal import run_goal
+        a = self.agent([self.todo("[ ] viết module m\n[ ] viết module n"), Reply(content="kế hoạch"),
+                        self.write("m.py"), Reply(content="xong m"),                        # chỉ đổi mã, không test -> bổ sung
+                        self.write("test_m.py"), Reply(content="đã thêm test"),             # bổ sung đạt
+                        self.write("n.py"), self.write("test_n.py"), Reply(content="xong n")])
+        res = run_goal(a, "mục tiêu", step_budget=5, plan_steps=5)
+        self.assertEqual([r.status for r in res], ["done", "done"])
+        self.assertIn("test_m.py", res[0].note)
+        self.assertTrue(any("chưa thêm/sửa test" in (m.get("content") or "") for m in a.messages))
+
+    def test_code_without_test_blocked_when_never_fixed_and_flag_disables_rule(self):
+        from harness.goal import run_goal
+        script = lambda: [self.todo("[ ] viết module m"), Reply(content="kế hoạch"), self.write("m.py"), Reply(content="xong"),
+                          Reply(content="xong rồi"), Reply(content="xong thật")]
+        res = run_goal(self.agent(script()), "mục tiêu", step_budget=5, plan_steps=5)
+        self.assertEqual(res[0].status, "blocked")
+        self.assertIn("chưa thêm/sửa test", res[0].note)
+        self.ws.root.joinpath("m.py").unlink()
+        res2 = run_goal(self.agent(script()[:4]), "mục tiêu", step_budget=5, plan_steps=5, require_tests=False)
+        self.assertEqual(res2[0].status, "done")
+
+    def test_verify_off_during_planning_and_baseline_frozen(self):
+        from harness.goal import run_goal
+        calls = []
+        outs = ["FAIL: test_cu (m.T.test_cu)\nFAILED (failures=1)"] + ["FAIL: test_cu (m.T.test_cu)\nFAIL: test_moi (m.T.test_moi)\nFAILED (failures=2)"] * 6
+        def verify():
+            calls.append(1)
+            return False, outs[min(len(calls) - 1, len(outs) - 1)]
+        a = self.agent([self.todo("[ ] việc A - test"), Reply(content="kế hoạch"), self.write("a.py"), self.write("test_a.py"),
+                        Reply(content="xong A"), Reply(content="sửa rồi"), Reply(content="thôi")], verify=verify, verify_rounds=2)
+        run_goal(a, "mục tiêu", step_budget=6, plan_steps=5)
+        self.assertEqual(len(calls), 4)   # 1 baseline + 1 sau việc A (test_moi là lỗi MỚI nên bị chặn) + 1 sau vòng sửa + 1 kiểm tra cuối; KHÔNG chạy khi lập kế hoạch
+        self.assertTrue(any("[Kiểm tra tự động]" in (m.get("content") or "") and "test_moi" in m["content"] for m in a.messages))
+
+
+class LedgerTests(unittest.TestCase):
+    def test_evicted_actions_stay_visible_in_system_prompt(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([]), build_tools(ws), ws, ui=UI(io.StringIO()), max_context_chars=2500, summarize=True)
+        a.turn = 1
+        a.messages.append({"role": "user", "content": "làm", "_turn": 1})
+        def call(i, name, args):
+            a.messages.append({"role": "assistant", "content": "", "tool_calls": [{"id": str(i), "type": "function",
+                               "function": {"name": name, "arguments": json.dumps(args)}}]})
+            a.messages.append({"role": "tool", "tool_call_id": str(i), "content": "ok " + "z" * 400})
+        call(0, "bash", {"command": "cat >> tests/test_db.py << EOF class TestScheduler EOF"})
+        call(1, "bash", {"command": "cat >> tests/test_db.py << EOF class TestScheduler EOF"})
+        call(2, "write_file", {"path": "people_memory/memory.py", "content": "a\nb\n"})
+        call(3, "read_file", {"path": "x"})                      # đọc thì không phải hành động có tác dụng phụ
+        for i in range(4, 12):
+            call(i, "read_file", {"path": "y" + str(i)})
+        a.compact()
+        sysmsg = a.messages[0]["content"]
+        self.assertIn("NHẬT KÝ VIỆC BẠN ĐÃ LÀM", sysmsg)
+        self.assertIn("tests/test_db.py", sysmsg)
+        self.assertIn("(×2)", sysmsg)                             # lặp liên tiếp được gộp, để model thấy mình đang lặp
+        self.assertIn("write_file: people_memory/memory.py (2 dòng)", sysmsg)
+        self.assertNotIn("read_file", a.ledger[0])
+
+    def test_ledger_persists_across_save_load(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([]), build_tools(ws), ws, ui=UI(io.StringIO()))
+        a.ledger = ["bash: echo 1"]
+        a.save(ws.root / "s.json")
+        b = Agent(SmartClient([]), build_tools(ws), ws, ui=UI(io.StringIO()))
+        b.load(ws.root / "s.json")
+        self.assertEqual(b.ledger, ["bash: echo 1"])
+        self.assertIn("echo 1", b.messages[0]["content"])
+
+
+class RepetitionGuardTests(unittest.TestCase):
+    def test_detect_repetition(self):
+        from harness.client import detect_repetition
+        loop = "Phân tích ban đầu. " + "Vòng lặp đệ quy! Mỗi lần gọi connect() lại gọi init_table(). " * 5
+        self.assertTrue(detect_repetition(loop))
+        self.assertFalse(detect_repetition("Câu một dài hơn hai mươi ký tự. Câu hai khác hẳn. Câu ba cũng khác. Câu bốn nữa."))
+        self.assertFalse(detect_repetition("Ok. Ok. Ok. Ok. Ok."))   # câu ngắn lặp (vd danh sách) không bị coi là vòng lặp
+        self.assertFalse(detect_repetition(""))
+
+    def test_client_aborts_stream_early(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from harness.client import LMStudioClient
+        sent = {"n": 0}
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_POST(self):
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                try:
+                    for _ in range(400):
+                        chunk = {"choices": [{"delta": {"reasoning_content": "Vòng lặp đệ quy! Mỗi lần gọi connect() lại gọi init(). "}}]}
+                        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()); self.wfile.flush()
+                        sent["n"] += 1
+                    self.wfile.write(b"data: [DONE]\n\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            r = LMStudioClient("m", f"http://127.0.0.1:{srv.server_port}").chat([{"role": "user", "content": "x"}])
+        finally:
+            srv.shutdown()
+        self.assertEqual(r.aborted, "repetition")
+        self.assertLess(len(r.thinking), 2000)     # ngắt sớm, không đọc hết 400 chunk
+
+    def test_agent_nudges_after_aborted_reply_and_continues(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        stuck = Reply(content="", aborted="repetition")
+        a = Agent(SmartClient([stuck, Reply(content="đã chọn một hành động và xong")]), build_tools(ws), ws, ui=UI(io.StringIO()))
+        self.assertEqual(a.run("việc"), "đã chọn một hành động và xong")
+        self.assertTrue(any("[Hệ thống]" in (m.get("content") or "") and "MỘT hành động" in m["content"] for m in a.messages))
+
+
+class DocOnlyItemTests(unittest.TestCase):
+    def test_readme_item_does_not_need_test_file(self):
+        from harness.goal import run_goal
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        todo = Reply(tool_calls=[{"id": "t", "name": "todo", "arguments": {"todos": "[ ] viết README ghi test nào chứng minh"}}])
+        w = Reply(tool_calls=[{"id": "w", "name": "write_file", "arguments": {"path": "README.md", "content": "# x\n"}}])
+        a = Agent(SmartClient([todo, Reply(content="kế hoạch"), w, Reply(content="xong")]), build_tools(ws), ws, ui=UI(io.StringIO()))
+        self.assertEqual([r.status for r in run_goal(a, "mục tiêu", step_budget=4, plan_steps=5)], ["done"])
+
+
+class EmptyReplyTests(unittest.TestCase):
+    def test_empty_reply_is_retried_with_nudge(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([Reply(content=""), Reply(content="  "), Reply(content="đã làm xong")]), build_tools(ws), ws,
+                  ui=UI(io.StringIO()))
+        self.assertEqual(a.run("việc"), "đã làm xong")
+        self.assertEqual(sum("[Hệ thống] Bạn chưa trả lời gì" in (m.get("content") or "") for m in a.messages), 2)
+
+    def test_gives_up_after_two_retries(self):
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        a = Agent(SmartClient([Reply(content="")] * 3), build_tools(ws), ws, ui=UI(io.StringIO()))
+        self.assertEqual(a.run("việc"), "")     # không lặp vô hạn
+
+
+class ClientHTTPLevelTests(unittest.TestCase):
+    """Test client qua HTTP thật (không dùng client giả) để bắt lỗi trong chính lớp stream."""
+    def serve(self, chunks):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_POST(self):
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                for c in chunks:
+                    self.wfile.write(f"data: {json.dumps(c, ensure_ascii=False)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        from harness.client import LMStudioClient
+        return LMStudioClient("m", f"http://127.0.0.1:{srv.server_port}")
+
+    def test_tool_calls_are_assembled_from_stream(self):
+        client = self.serve([
+            {"choices": [{"delta": {"reasoning_content": "nghĩ một chút"}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": "{\"pa"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "th\": \"a.py\"}"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 1, "id": "c2", "function": {"name": "list_dir", "arguments": "{}"}}]}}]},
+            {"choices": [], "usage": {"prompt_tokens": 123, "completion_tokens": 9}},
+        ])
+        r = client.chat([{"role": "user", "content": "x"}])
+        self.assertEqual([(c["id"], c["name"], c["arguments"]) for c in r.tool_calls],
+                         [("c1", "read_file", {"path": "a.py"}), ("c2", "list_dir", {})])
+        self.assertEqual((r.thinking, r.prompt_tokens, r.aborted), ("nghĩ một chút", 123, ""))
+
+    def test_plain_content_stream(self):
+        client = self.serve([{"choices": [{"delta": {"content": "Xin "}}]}, {"choices": [{"delta": {"content": "chào"}}]}])
+        self.assertEqual(client.chat([{"role": "user", "content": "x"}]).content, "Xin chào")
+
+
+class ChangedFilesTests(unittest.TestCase):
+    def test_deleting_junk_db_counts_but_creating_or_touching_does_not(self):
+        from harness.goal import changed_files
+        before = {"a.py": (1, 1), "x.db": (5, 1), "y.db": (5, 1)}
+        after = {"a.py": (1, 1), "y.db": (9, 2), "z.db": (3, 3)}      # x.db bị xoá; y.db bị sửa; z.db mới sinh ra
+        self.assertEqual(changed_files(before, after), ["x.db"])
+        self.assertEqual(changed_files({"a.py": (1, 1)}, {"a.py": (2, 2), "z.db": (1, 1)}), ["a.py"])
+        self.assertEqual(changed_files({"a.py": (1, 1)}, {"a.py": (1, 1), "z.db": (1, 1)}), [])
+
+
+class RepairAfterExhaustionTests(unittest.TestCase):
+    def test_exhausted_item_leaving_red_suite_triggers_repair_before_next_item(self):
+        from harness.goal import run_goal
+        d = tempfile.TemporaryDirectory(); ws = Workspace(d.name)
+        outs = [(True, "OK"), (False, "FAIL: test_x (m.T.test_x)\nFAILED (failures=1)"), (True, "OK"), (True, "OK")]
+        calls = []
+        def verify():
+            calls.append(1)
+            return outs[min(len(calls) - 1, len(outs) - 1)]
+        loop = [Reply(tool_calls=[{"id": str(i), "name": "list_dir", "arguments": {"path": str(i)}}]) for i in range(3)]
+        todo = Reply(tool_calls=[{"id": "t", "name": "todo", "arguments": {"todos": "[ ] việc A"}}])
+        a = Agent(SmartClient([todo, Reply(content="kế hoạch"), *loop, Reply(content="đã sửa test, xanh rồi")]),
+                  build_tools(ws), ws, ui=UI(io.StringIO()), verify=verify)
+        res = run_goal(a, "mục tiêu", step_budget=3, plan_steps=5, require_change=False)
+        self.assertEqual(res[0].status, "blocked")                            # việc vẫn bị ghi là hết bước
+        self.assertIn("đã yêu cầu sửa", res[0].note)
+        self.assertTrue(any("bộ test ĐỎ" in (m.get("content") or "") and "test_x" in m["content"] for m in a.messages))

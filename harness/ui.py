@@ -132,6 +132,10 @@ class UI:
         self.end_stream()
         self.w(self.c("muted", "◌ đã tóm tắt hội thoại cũ để giải phóng context"))
 
+    def verify_note(self, ok: bool, k: int, n: int):
+        self.end_stream()
+        self.w(self.c("ok", "✓ kiểm tra tự động: đạt") if ok else self.c("err", f"✗ kiểm tra tự động thất bại (vòng {k}/{n}): agent phải sửa tiếp"))
+
     def footer(self, seconds: float, steps: int, ctx: str = ""):
         self.w(self.c("dim", f"  ⏱ {seconds:.1f}s · {steps} lượt" + (f" · ctx {ctx}" if ctx else "")))
 

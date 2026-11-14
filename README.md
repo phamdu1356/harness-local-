@@ -38,6 +38,19 @@ Tìm lai: SQLite FTS5/BM25 (khớp từ, không phân biệt dấu) + embedding 
 - **Embedding:** tự bật `llama-server --embeddings` bằng CPU với model embedding trong `~/.lmstudio/models` (vd `bge-m3`), không tốn VRAM; ~25 ms/lần tìm. Ngưỡng cosine 0,5 (đo trên bge-m3). Mục chỉ khớp từ khoá phải chứa từ nguyên vẹn đúng dấu. Server embedding lỗi/tắt thì tự rơi về BM25; mục cũ chưa có vector được nhúng bù khi khởi động.
 - Lệnh: `/memory` xem thống kê, `/forget` xoá hết; `--no-memory` để tắt.
 
+
+## Chạy việc dài một cách đáng tin (agent tự làm, harness kiểm chứng)
+```bash
+python3 -m harness -C DỰ_ÁN --resume build --session build \
+  --verify "python3 -m unittest discover -s tests" --step-budget 30 --max-items 8 \
+  --goal "<mục tiêu lớn kèm hiện trạng đã kiểm chứng>"
+```
+- **Nhốt trong một thư mục:** `bash` chạy qua Landlock (kernel Linux, không cần root): chỉ đọc/ghi được trong workspace (+ đọc `/usr`, `/lib`...). Tắt bằng `--no-sandbox`. Không dựng được sandbox thì `bash` tự tắt.
+- **`--goal`:** agent lập kế hoạch (giai đoạn chỉ-đọc), harness NẮM kế hoạch và giao từng việc với ngân sách bước riêng; hết bước thì đánh dấu bị chặn và sang việc kế; hết bước mà suite đỏ thì bắt buộc sửa trước.
+- **`--verify LỆNH`:** chạy khi agent báo xong; chỉ chặn lỗi MỚI so với mốc cố định; thất bại thì agent phải sửa tiếp (tối đa 3 vòng). Một việc chỉ tính xong khi file thật sự đổi và (nếu đổi `.py`) có test đi kèm; chưa đạt thì có 2 lần bổ sung rồi mới chặn (`--no-require-tests` để tắt).
+- **Chống kẹt:** ngắt suy nghĩ bị lặp, nhắc khi không dùng `todo` / chạy script lẻ / 25 bước không sửa file, thử lại khi trả lời rỗng, báo file đã đổi kể từ lần đọc, nhật ký hành động tự ghi trong prompt (agent không "mất trí nhớ" khi context bị dọn).
+- **Context:** đếm cả tham số `tool_calls`, dọn một lần xuống 70% ngân sách (giữ cache tiền tố của server), dọn được ngay trong một lượt dài.
+
 ## Context
 - Đọc **số token thật** từ server (và context đang nạp của LM Studio/llama-server), học tỉ lệ ký tự/token để tính ngân sách (65% context dành cho hội thoại). `/context` xem chi tiết; chân mỗi lượt hiện `ctx 2.0k/63.5k`.
 - Khi vượt ngân sách: lược kết quả tool cũ → đẩy cả lượt cũ ra, **tóm tắt bằng chính model** vào prompt hệ thống (`--no-summary` để tắt). Nội dung gốc vẫn nằm trong bộ nhớ ngoài.
