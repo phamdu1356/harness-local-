@@ -51,6 +51,17 @@ python3 -m harness -C DỰ_ÁN --resume build --session build \
 - **Chống kẹt:** ngắt suy nghĩ bị lặp, nhắc khi không dùng `todo` / chạy script lẻ / 25 bước không sửa file, thử lại khi trả lời rỗng, báo file đã đổi kể từ lần đọc, nhật ký hành động tự ghi trong prompt (agent không "mất trí nhớ" khi context bị dọn).
 - **Context:** đếm cả tham số `tool_calls`, dọn một lần xuống 70% ngân sách (giữ cache tiền tố của server), dọn được ngay trong một lượt dài.
 
+
+## Nghiệm thu độc lập theo giai đoạn (`--oracle` + `--stages`)
+Giao một dự án lớn cho model nhỏ thì cách đáng tin nhất là có **một bộ nghiệm thu chạy được đặt ngoài vùng agent truy cập** (nó không đọc/sửa được).
+```bash
+python3 -m harness -C DỰ_ÁN --session v2 --stages --oracle examples/oracle/oracle.py \
+  --step-budget 40 --stage-rounds 4 --verify 'python3 -m unittest discover -s tests; rc=$?; [ $rc -eq 5 ] && exit 0; exit $rc'
+```
+- Oracle (xem `examples/oracle/oracle.py`) chạy app THẬT trong sandbox, dùng LLM giả và Telegram giả cục bộ, và báo lỗi cụ thể (đã gửi gì, mong đợi gì, nhận gì, gợi ý chẩn đoán). Giao ước dòng lệnh: `--list` và `--root DIR --upto K`.
+- Harness làm lần lượt từng giai đoạn; mỗi lần agent báo xong thì oracle chạy lại (kèm hồi quy các giai đoạn trước), thất bại thì lỗi cụ thể được trả cho agent; giai đoạn trước chưa đạt thì không sang giai đoạn sau.
+- Oracle mẫu được kiểm định bằng cách cố ý làm hỏng một bản tham chiếu 14 kiểu: bắt được 14/14.
+
 ## Context
 - Đọc **số token thật** từ server (và context đang nạp của LM Studio/llama-server), học tỉ lệ ký tự/token để tính ngân sách (65% context dành cho hội thoại). `/context` xem chi tiết; chân mỗi lượt hiện `ctx 2.0k/63.5k`.
 - Khi vượt ngân sách: lược kết quả tool cũ → đẩy cả lượt cũ ra, **tóm tắt bằng chính model** vào prompt hệ thống (`--no-summary` để tắt). Nội dung gốc vẫn nằm trong bộ nhớ ngoài.

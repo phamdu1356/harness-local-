@@ -133,6 +133,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--step-budget", type=int, default=30, help="số bước tối đa cho MỖI việc trong --goal")
     ap.add_argument("--max-items", type=int, default=10, help="số việc tối đa trong --goal")
     ap.add_argument("--no-require-tests", action="store_true", help="--goal: không đòi test đi kèm khi đổi mã")
+    ap.add_argument("--oracle", metavar="SCRIPT", help="script nghiệm thu độc lập (ngoài sandbox) cho --stages")
+    ap.add_argument("--stages", action="store_true", help="làm lần lượt từng giai đoạn của --oracle, mỗi giai đoạn kiểm chứng bằng oracle")
+    ap.add_argument("--start-stage", type=int, default=1, help="bắt đầu từ giai đoạn này")
+    ap.add_argument("--stage-rounds", type=int, default=4, help="số vòng sửa tối đa cho mỗi giai đoạn")
     ap.add_argument("--resume", nargs="?", const="last", metavar="TÊN", help="mở lại phiên đã lưu (mặc định: phiên gần nhất)")
     ap.add_argument("--session", metavar="TÊN", help="lưu phiên này thêm dưới tên TÊN")
     a = ap.parse_args(argv)
@@ -165,6 +169,22 @@ def run(a) -> int:
                 ui.w(ui.c("muted", f"◌ đã mở lại phiên '{a.resume}' ({agent.turn} lượt)"))
             else:
                 ui.error(f"không tìm thấy phiên '{a.resume}' trong {sess_dir}")
+        if a.stages:
+            from .stages import Oracle, report as stage_report, run_stages
+            if not a.oracle:
+                ui.error("--stages cần --oracle SCRIPT")
+                return 1
+            unit = None
+            if a.verify:
+                def unit():
+                    out = agent.tools["bash"].fn(a.verify)
+                    m = re.search(r"\[exit (\d+)\]\s*$", out)
+                    return bool(m and m.group(1) == "0"), out
+            results = run_stages(agent, Oracle(a.oracle, ws.root), a.step_budget, a.stage_rounds, a.start_stage,
+                                 unit_verify=unit, on_stage_done=save)
+            save()
+            ui.w("\n" + stage_report(results))
+            return 0 if results and all(r.ok for r in results) and results[-1].id >= 7 else 2
         if a.goal:
             from .goal import report, run_goal
             results = run_goal(agent, a.goal, a.step_budget, a.max_items, require_tests=not a.no_require_tests)

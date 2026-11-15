@@ -979,3 +979,59 @@ class RepairAfterExhaustionTests(unittest.TestCase):
         self.assertEqual(res[0].status, "blocked")                            # việc vẫn bị ghi là hết bước
         self.assertIn("đã yêu cầu sửa", res[0].note)
         self.assertTrue(any("bộ test ĐỎ" in (m.get("content") or "") and "test_x" in m["content"] for m in a.messages))
+
+
+FAKE_ORACLE = '''import sys, json, pathlib
+root = pathlib.Path(sys.argv[sys.argv.index("--root") + 1]) if "--root" in sys.argv else pathlib.Path(".")
+if "--list" in sys.argv:
+    print(json.dumps([{"id": 1, "title": "A", "brief": "tạo a.txt"}, {"id": 2, "title": "B", "brief": "tạo b.txt"}])); sys.exit(0)
+upto = int(sys.argv[sys.argv.index("--upto") + 1])
+bad = [n for n in ["a.txt", "b.txt"][:upto] if not (root / n).exists()]
+for n in bad:
+    print(f"✗ [S1] cần {n}\\n   vấn đề: file {n} chưa có")
+print("✓ [S1] cái đã đạt")
+print("KẾT QUẢ:", "CHƯA ĐẠT" if bad else "ĐẠT"); sys.exit(1 if bad else 0)
+'''
+
+
+class StagesTests(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.TemporaryDirectory(); self.ws = Workspace(self.d.name)
+        self.script = self.ws.root.parent / (self.ws.root.name + "_oracle.py")
+        self.script.write_text(FAKE_ORACLE)
+        self.addCleanup(self.script.unlink)
+
+    def agent(self, script):
+        return Agent(SmartClient(script), build_tools(self.ws), self.ws, ui=UI(io.StringIO()))
+
+    def w(self, path):
+        return Reply(tool_calls=[{"id": "w" + path, "name": "write_file", "arguments": {"path": path, "content": "x\n"}}])
+
+    def test_condense_keeps_failures_only(self):
+        from harness.stages import condense
+        out = "✓ [S1] tốt\n✗ [S2] hỏng\n   vấn đề: x\n   nhận được: y\n✓ [S3] tốt\nGIAI ĐOẠN 1: ĐẠT (1/1)\nKẾT QUẢ: CHƯA ĐẠT"
+        self.assertEqual(condense(out), "✗ [S2] hỏng\n   vấn đề: x\n   nhận được: y\nGIAI ĐOẠN 1: ĐẠT (1/1)\nKẾT QUẢ: CHƯA ĐẠT")
+
+    def test_runs_stages_in_order_and_gates_completion(self):
+        from harness.stages import Oracle, run_stages
+        a = self.agent([self.w("a.txt"), Reply(content="xong 1"),
+                        self.w("b.txt"), Reply(content="xong 2")])
+        res = run_stages(a, Oracle(self.script, self.ws.root), step_budget=5, max_rounds=2)
+        self.assertEqual([(r.id, r.ok) for r in res], [(1, True), (2, True)])
+        self.assertTrue(any("GIAI ĐOẠN 1/2" in (m.get("content") or "") and "file a.txt chưa có" in m["content"] for m in a.messages))  # có đưa lỗi cụ thể
+
+    def test_completion_claim_is_rejected_until_oracle_passes(self):
+        from harness.stages import Oracle, run_stages
+        a = self.agent([Reply(content="xong rồi"),                 # nói xong nhưng chưa làm gì: cổng oracle trả lại
+                        self.w("a.txt"), Reply(content="giờ xong"),
+                        self.w("b.txt"), Reply(content="xong 2")])
+        res = run_stages(a, Oracle(self.script, self.ws.root), step_budget=6, max_rounds=2)
+        self.assertEqual([r.ok for r in res], [True, True])
+        self.assertTrue(any("[Kiểm tra tự động]" in (m.get("content") or "") for m in a.messages))
+
+    def test_stops_when_a_stage_never_passes(self):
+        from harness.stages import Oracle, run_stages
+        a = self.agent([Reply(content="xong")] * 12)
+        res = run_stages(a, Oracle(self.script, self.ws.root), step_budget=4, max_rounds=1)
+        self.assertEqual([(r.id, r.ok) for r in res], [(1, False)])    # không sang giai đoạn 2 khi giai đoạn 1 chưa đạt
+        self.assertIn("✗ [S1] cần a.txt", res[0].output)
