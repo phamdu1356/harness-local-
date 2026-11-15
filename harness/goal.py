@@ -149,7 +149,7 @@ def changed_files(before: dict, after: dict) -> list[str]:
 
 def run_goal(agent, goal: str, step_budget: int = 30, max_items: int = 10, plan_steps: int = 15,
              ui: UI | None = None, require_change: bool = True, require_tests: bool = True,
-             fix_rounds: int = 2) -> list[ItemResult]:
+             fix_rounds: int = 2, on_item_done=None) -> list[ItemResult]:
     ui = ui or agent.ui
     todo = agent.tools["todo"].state
     saved_steps, saved_tools, saved_verify = agent.max_steps, agent.tools, agent.verify
@@ -209,6 +209,8 @@ def run_goal(agent, goal: str, step_budget: int = 30, max_items: int = 10, plan_
                     agent.run(REPAIR_PROMPT.format(output=clip(out_r, 2500)))
                     results[-1].note += " (đã để lại test đỏ, đã yêu cầu sửa)"
             todo[:] = render(items)   # khôi phục kế hoạch chuẩn, bỏ mọi chỉnh sửa của model
+            if on_item_done:
+                on_item_done()   # lưu phiên sau mỗi việc: server chết giữa chừng thì không mất cả phiên
     finally:
         agent.max_steps, agent.tools = saved_steps, saved_tools
         agent.verify_baseline = None

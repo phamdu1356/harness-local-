@@ -121,6 +121,11 @@ def run_stages(agent, oracle: Oracle, step_budget: int = 40, max_rounds: int = 4
     return results
 
 
+def exit_code(results: list[StageResult], last_stage_id: int) -> int:
+    """0 chỉ khi đã chạy tới giai đoạn CUỐI CÙNG của oracle và mọi giai đoạn đã chạy đều đạt; ngược lại 2."""
+    return 0 if results and last_stage_id > 0 and all(r.ok for r in results) and results[-1].id >= last_stage_id else 2
+
+
 def report(results: list[StageResult]) -> str:
     if not results:
         return "Không có giai đoạn nào được chạy."

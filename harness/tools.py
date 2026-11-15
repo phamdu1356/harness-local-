@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -229,6 +229,7 @@ def build_tools(ws: Workspace, bash_timeout: int = 60, sandbox: bool = True) -> 
     def bash(command: str) -> str:
         env = {**os.environ, "PAGER": "cat"}
         if sandbox:
+            env = _sandbox.clean_env(env)   # model đọc được mọi thứ lệnh của nó in ra: đừng đưa token/khoá API của bạn vào
             if not _sandbox.available():  # đóng kín: không sandbox được thì không chạy
                 return ("LỖI: không dựng được sandbox (kernel thiếu Landlock) nên bash bị tắt để giữ giới hạn "
                         "thư mục. Chạy với --no-sandbox nếu chấp nhận rủi ro.")
@@ -304,7 +305,8 @@ def build_tools(ws: Workspace, bash_timeout: int = 60, sandbox: bool = True) -> 
              {"pattern": P(S, "regex Python"), "path": P(S, "file/thư mục", True),
               "include": P(S, "lọc tên file, vd '*.py'", True)}, grep, read_only=True),
         Tool("web_search", "Tìm kiếm web, trả về tiêu đề, URL và đoạn trích. Dùng web_fetch để đọc kỹ một kết quả.",
-             {"query": P(S, "từ khoá tìm kiếm"), "num": P(I, "số kết quả, mặc định 5", True)}, web_search, read_only=True),
+             {"query": P(S, "từ khoá tìm kiếm"), "num": P(I, "số kết quả, mặc định 5", True)}, web_search,
+             needs_approval=True, read_only=True),   # câu truy vấn rời máy bạn: --ask phải hỏi
         Tool("todo", "Ghi/cập nhật kế hoạch cho việc nhiều bước. Mỗi dòng: '[ ] việc', '[~] đang làm', '[x] xong'.",
              {"todos": P(S, "toàn bộ danh sách, mỗi việc một dòng")}, todo, read_only=True),
         Tool("write_file", "Tạo file mới hoặc ghi đè toàn bộ file.",

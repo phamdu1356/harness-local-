@@ -332,6 +332,15 @@ class Agent:
             out.append(c)
         return out
 
+    def drop_dangling_turn(self) -> bool:
+        """Lượt vừa lỗi trước khi model kịp làm gì: bỏ tin nhắn người dùng đang treo để gõ lại không bị trùng lượt."""
+        last = self.messages[-1] if self.messages else {}
+        if last.get("role") == "user" and last.get("_turn") == self.turn:
+            self.messages.pop()
+            self.turn -= 1
+            return True
+        return False
+
     # ---------- lưu / mở lại phiên ----------
     def save(self, path) -> None:
         from pathlib import Path
@@ -380,17 +389,26 @@ class Agent:
     # ---------- vòng lặp ----------
     _OVERFLOW = re.compile(r"context|exceed|too (long|large)|n_ctx|n_keep|prompt.*tokens", re.I)
 
+    NET_RETRY_DELAY = 2.0   # giây nghỉ trước khi thử lại sau lỗi đường truyền
+
     def _chat(self, schemas):
-        for attempt in (0, 1):
+        overflow_retried = net_retried = False
+        while True:
             self._schema_len = len(json.dumps(schemas)) if schemas else 0
             self.ui.spinner_start()
             try:
                 return self.client.chat(self._view(), schemas,
                                         on_token=self.ui.stream_answer, on_thinking=self.ui.stream_think)
             except LLMError as e:
-                if attempt == 0 and self._OVERFLOW.search(str(e)):
+                if not overflow_retried and self._OVERFLOW.search(str(e)):
+                    overflow_retried = True
                     self._shrink *= 0.6  # tràn context: siết ngân sách rồi thử lại một lần
                     self.compact()
+                    continue
+                if getattr(e, "transient", False) and not net_retried:
+                    net_retried = True   # đứt kết nối/luồng hỏng: nghỉ một chút rồi thử lại đúng một lần
+                    self.ui.error(f"lỗi đường truyền tới server model ({str(e)[:100]}), thử lại sau {self.NET_RETRY_DELAY:g}s")
+                    time.sleep(self.NET_RETRY_DELAY)
                     continue
                 raise
             finally:
@@ -505,6 +523,7 @@ def delegate_tool(parent: Agent) -> Tool:
     def delegate(task: str) -> str:
         sub = Agent(parent.client, {n: t for n, t in parent.tools.items() if n in SUBAGENT_TOOLS}, parent.ws,
                     ui=UI(io.StringIO()), memory=None, effort=parent.effort, max_steps=12,
+                    auto_approve=parent.auto_approve, approve=parent.approve,   # --ask áp dụng cả cho subagent (web_fetch/web_search)
                     system_extra=SUBAGENT_RULES, max_context_chars=parent.max_context_chars,
                     max_context_tokens=parent.max_context_tokens, text_tools=parent.text_tools)
         return clip(sub.run(task).strip() or "(subagent không trả về kết quả)", 3000)

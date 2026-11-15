@@ -21,7 +21,7 @@ Tuỳ chọn: `-m`, `--host`, `--temperature`, `--max-steps`, `--system "..."|@f
 Log server: `/tmp/harness-llama-server.log`.
 
 ## Tool
-Mặc định agent **toàn quyền**, không hỏi duyệt; dùng `--ask` để hỏi trước các tool ghi/xoá/chạy lệnh/web/MCP.
+Mặc định agent **toàn quyền**, không hỏi duyệt; dùng `--ask` để hỏi trước các tool ghi/xoá/chạy lệnh/web (`web_fetch`, `web_search`)/MCP. Subagent của `delegate` cũng phải qua duyệt khi bật `--ask`.
 `read_file`, `list_dir`, `glob`, `grep`, `todo`, `write_file`, `edit_file`, `move_file`, `delete_file`, `bash`, `web_fetch`, `web_search`, `delegate`.
 Tool file bị giới hạn trong workspace, nhưng **`bash` thì không** (model có thể `cat` file ngoài workspace): đó là hệ quả của toàn quyền.
 - `web_search`: DuckDuckGo (có thể bị chặn truy vấn tự động, khi đó tool báo lỗi rõ). Ổn định hơn: đặt `HARNESS_SEARX_URL` trỏ tới SearXNG của bạn.
@@ -46,8 +46,11 @@ python3 -m harness -C DỰ_ÁN --resume build --session build \
   --goal "<mục tiêu lớn kèm hiện trạng đã kiểm chứng>"
 ```
 - **Nhốt trong một thư mục:** `bash` chạy qua Landlock (kernel Linux, không cần root): chỉ đọc/ghi được trong workspace (+ đọc `/usr`, `/lib`...). Tắt bằng `--no-sandbox`. Không dựng được sandbox thì `bash` tự tắt.
+  - **Giới hạn cần biết:** sandbox chỉ nhốt *file*, **không chặn mạng** (lệnh trong `bash` vẫn kết nối ra ngoài được), và **MCP server chạy ngoài sandbox** với đầy đủ quyền của bạn. Đừng để agent toàn quyền đọc nội dung web không tin cậy khi workspace chứa thứ nhạy cảm.
+  - **Biến môi trường:** lệnh `bash` không nhận các biến có tên trông như bí mật (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*API_KEY*`, `*_KEY`, `*AUTH*`, `*COOKIE*`...). Lọc theo tên nên chỉ là lớp phòng thủ thêm; cần giữ biến nào thì liệt kê trong `HARNESS_ENV_ALLOW=TÊN1,TÊN2`.
 - **`--goal`:** agent lập kế hoạch (giai đoạn chỉ-đọc), harness NẮM kế hoạch và giao từng việc với ngân sách bước riêng; hết bước thì đánh dấu bị chặn và sang việc kế; hết bước mà suite đỏ thì bắt buộc sửa trước.
 - **`--verify LỆNH`:** chạy khi agent báo xong; chỉ chặn lỗi MỚI so với mốc cố định; thất bại thì agent phải sửa tiếp (tối đa 3 vòng). Một việc chỉ tính xong khi file thật sự đổi và (nếu đổi `.py`) có test đi kèm; chưa đạt thì có 2 lần bổ sung rồi mới chặn (`--no-require-tests` để tắt).
+- **Bền khi server lỗi:** đứt kết nối/quá hạn/luồng hỏng giữa chừng được thử lại một lần; vẫn lỗi thì phiên được lưu (`--goal` còn lưu sau MỖI việc, `--stages` sau mỗi giai đoạn) để `--resume`. Ở REPL, lỗi server chỉ báo lỗi rồi cho gõ tiếp.
 - **Chống kẹt:** ngắt suy nghĩ bị lặp, nhắc khi không dùng `todo` / chạy script lẻ / 25 bước không sửa file, thử lại khi trả lời rỗng, báo file đã đổi kể từ lần đọc, nhật ký hành động tự ghi trong prompt (agent không "mất trí nhớ" khi context bị dọn).
 - **Context:** đếm cả tham số `tool_calls`, dọn một lần xuống 70% ngân sách (giữ cache tiền tố của server), dọn được ngay trong một lượt dài.
 
@@ -60,7 +63,8 @@ python3 -m harness -C DỰ_ÁN --session v2 --stages --oracle examples/oracle/or
 ```
 - Oracle (xem `examples/oracle/oracle.py`) chạy app THẬT trong sandbox, dùng LLM giả và Telegram giả cục bộ, và báo lỗi cụ thể (đã gửi gì, mong đợi gì, nhận gì, gợi ý chẩn đoán). Giao ước dòng lệnh: `--list` và `--root DIR --upto K`.
 - Harness làm lần lượt từng giai đoạn; mỗi lần agent báo xong thì oracle chạy lại (kèm hồi quy các giai đoạn trước), thất bại thì lỗi cụ thể được trả cho agent; giai đoạn trước chưa đạt thì không sang giai đoạn sau.
-- Oracle mẫu được kiểm định bằng cách cố ý làm hỏng một bản tham chiếu 14 kiểu: bắt được 14/14.
+- Mã thoát `--stages`: 0 chỉ khi đã đạt tới giai đoạn CUỐI CÙNG mà oracle liệt kê (`--list`) và mọi giai đoạn đã chạy đều đạt; ngược lại 2.
+- Oracle mẫu được kiểm định bằng cách cố ý làm hỏng một bản tham chiếu 14 kiểu: bắt được 14/14 (ghi nhận của tác giả; bản tham chiếu và script làm hỏng chưa nằm trong repo).
 
 ## Context
 - Đọc **số token thật** từ server (và context đang nạp của LM Studio/llama-server), học tỉ lệ ký tự/token để tính ngân sách (65% context dành cho hội thoại). `/context` xem chi tiết; chân mỗi lượt hiện `ctx 2.0k/63.5k`.

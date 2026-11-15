@@ -1035,3 +1035,281 @@ class StagesTests(unittest.TestCase):
         res = run_stages(a, Oracle(self.script, self.ws.root), step_budget=4, max_rounds=1)
         self.assertEqual([(r.id, r.ok) for r in res], [(1, False)])    # không sang giai đoạn 2 khi giai đoạn 1 chưa đạt
         self.assertIn("✗ [S1] cần a.txt", res[0].output)
+
+
+# ---------------------------------------------------------------- độ bền khi server model lỗi giữa chừng
+class ClientFailureTests(unittest.TestCase):
+    """Lỗi giữa chừng khi stream phải thành LLMError(transient), không được lọt ra thành TimeoutError/JSONDecodeError/..."""
+    def client(self, mode):
+        import socket
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_POST(self):
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                self.wfile.write(b'data: {"choices":[{"delta":{"content":"xin "}}]}\n\n'); self.wfile.flush()
+                try:
+                    if mode == "stall":
+                        time.sleep(2)
+                    elif mode == "badjson":
+                        self.wfile.write(b"data: {not json\n\n"); self.wfile.flush()
+                    elif mode == "reset":
+                        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+                        self.connection.close()
+                except OSError:
+                    pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close); self.addCleanup(srv.shutdown)
+        from harness.client import LMStudioClient
+        return LMStudioClient("m", f"http://127.0.0.1:{srv.server_port}", timeout=0.5)
+
+    def check(self, mode):
+        from harness.client import LLMError
+        with self.assertRaises(LLMError) as cm:
+            self.client(mode).chat([{"role": "user", "content": "x"}])
+        self.assertTrue(cm.exception.transient)
+
+    def test_stalled_stream_times_out_as_llm_error(self): self.check("stall")
+    def test_garbled_stream_line_is_llm_error(self): self.check("badjson")
+    def test_connection_reset_mid_stream_is_llm_error(self): self.check("reset")
+
+    def test_http_error_is_not_transient(self):
+        from harness.client import LLMError, LMStudioClient
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_POST(self):
+                self.send_response(400); self.end_headers(); self.wfile.write(b"bad request")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close); self.addCleanup(srv.shutdown)
+        with self.assertRaises(LLMError) as cm:
+            LMStudioClient("m", f"http://127.0.0.1:{srv.server_port}").chat([{"role": "user", "content": "x"}])
+        self.assertFalse(cm.exception.transient)
+
+
+class NetRetryTests(unittest.TestCase):
+    class Dead:
+        """Client luôn lỗi; đếm số lần bị gọi."""
+        def __init__(self, transient): self.calls, self.transient = 0, transient
+        def chat(self, messages, tools=None, on_token=None, on_thinking=None):
+            from harness.client import LLMError
+            self.calls += 1
+            raise LLMError("đứt kết nối", transient=self.transient)
+
+    def agent(self, client):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup); ws = Workspace(d.name)
+        a = Agent(client, build_tools(ws), ws, ui=UI(io.StringIO()))
+        a.NET_RETRY_DELAY = 0
+        return a
+
+    def test_transient_error_is_retried_once_then_succeeds(self):
+        from harness.client import LLMError
+        c = SmartClient([Reply(content="xong")], fail_first=LLMError("đứt", transient=True))
+        self.assertEqual(self.agent(c).run("chào"), "xong")
+
+    def test_persistent_transient_error_is_raised_after_one_retry(self):
+        from harness.client import LLMError
+        c = self.Dead(transient=True)
+        with self.assertRaises(LLMError):
+            self.agent(c).run("chào")
+        self.assertEqual(c.calls, 2)
+
+    def test_non_transient_error_is_not_retried(self):
+        from harness.client import LLMError
+        c = self.Dead(transient=False)
+        with self.assertRaises(LLMError):
+            self.agent(c).run("chào")
+        self.assertEqual(c.calls, 1)
+
+    def test_failed_turn_leaves_no_dangling_user_message(self):
+        from harness.client import LLMError
+        a = self.agent(self.Dead(transient=False))
+        with self.assertRaises(LLMError):
+            a.run("chào")
+        self.assertTrue(a.drop_dangling_turn())
+        self.assertEqual((a.turn, [m["role"] for m in a.messages]), (0, ["system"]))
+        self.assertFalse(a.drop_dangling_turn())   # không còn gì để bỏ
+
+    def test_turn_that_already_did_work_is_kept(self):
+        from harness.client import LLMError
+
+        class Once(self.Dead):
+            def chat(s, *a, **k):
+                if s.calls == 0:
+                    s.calls += 1
+                    return Reply(tool_calls=[{"id": "1", "name": "list_dir", "arguments": {"path": "."}}])
+                return super().chat(*a, **k)
+        a = self.agent(Once(transient=False))
+        with self.assertRaises(LLMError):
+            a.run("liệt kê")
+        self.assertFalse(a.drop_dangling_turn())   # đã có tool_call + kết quả: giữ nguyên, model tiếp tục từ đó
+
+
+class GoalSavesProgressTests(unittest.TestCase):
+    def test_on_item_done_called_after_each_item(self):
+        from harness.goal import run_goal
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup); ws = Workspace(d.name)
+        todo = lambda t: Reply(tool_calls=[{"id": "t", "name": "todo", "arguments": {"todos": t}}])
+        a = Agent(SmartClient([todo("[ ] A\n[ ] B"), Reply(content="kế hoạch"), Reply(content="xong A"), Reply(content="xong B")]),
+                  build_tools(ws), ws, ui=UI(io.StringIO()))
+        seen = []
+        run_goal(a, "mục tiêu", step_budget=3, require_change=False, on_item_done=lambda: seen.append(a.turn))
+        self.assertEqual(seen, [2, 3])   # gọi sau việc 1 (lượt 2) và sau việc 2 (lượt 3)
+
+    def test_cli_goal_keeps_session_when_server_dies_mid_run(self):
+        """Chạy CLI thật với server giả: việc 1 xong, rồi server ngắt kết nối. Phiên phải còn trên đĩa và lệnh trả mã 1."""
+        import contextlib
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from unittest import mock
+
+        calls = []
+
+        def sse(delta):
+            return ("data: " + json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False) + "\n\n").encode()
+
+        def tool(name, args):
+            return sse({"tool_calls": [{"index": 0, "id": f"c{len(calls)}", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]})
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self):
+                if self.path == "/v1/models":
+                    body = json.dumps({"data": [{"id": "fake"}]}).encode()
+                    self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+                else:
+                    self.send_response(404); self.end_headers()
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                calls.append(1)
+                script = {1: tool("todo", {"todos": "[ ] việc A\n[ ] việc B"}), 2: sse({"content": "kế hoạch xong"}),
+                          3: tool("write_file", {"path": "a.txt", "content": "x\n"}), 4: sse({"content": "xong việc A"})}
+                if len(calls) not in script:   # từ yêu cầu thứ 5: server "chết" giữa chừng
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+                    self.connection.close()
+                    return
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+                self.wfile.write(script[len(calls)]); self.wfile.write(b"data: [DONE]\n\n")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close); self.addCleanup(srv.shutdown)
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+
+        from harness import cli
+        out = io.StringIO()
+        with mock.patch.object(cli, "load_mcp_tools", lambda *a, **k: ({}, [])), \
+                mock.patch.object(Agent, "NET_RETRY_DELAY", 0), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = cli.main(["--host", f"http://127.0.0.1:{srv.server_port}", "-m", "fake", "-C", d.name, "--no-memory",
+                           "--no-embed", "--no-summary", "--goal", "mục tiêu", "--step-budget", "4", "--max-items", "2"])
+        self.assertEqual(rc, 1)
+        saved = Path(d.name, ".harness", "sessions", "last.json")
+        self.assertTrue(saved.exists(), out.getvalue())
+        self.assertIn("xong việc A", saved.read_text())
+        self.assertGreaterEqual(len(calls), 6)   # yêu cầu thứ 5 bị ngắt, đã thử lại một lần (yêu cầu thứ 6)
+
+
+class StageExitCodeTests(unittest.TestCase):
+    def test_exit_code_uses_real_last_stage_not_a_magic_number(self):
+        from harness.stages import StageResult, exit_code
+        ok = lambda i: StageResult(i, "t", True, 0, "")
+        self.assertEqual(exit_code([ok(1), ok(2)], 2), 0)                      # oracle chỉ có 2 giai đoạn: đạt cả hai là xong
+        self.assertEqual(exit_code([ok(1), ok(2)], 7), 2)                      # chưa tới giai đoạn cuối
+        self.assertEqual(exit_code([ok(1), StageResult(2, "t", False, 4, "")], 2), 2)
+        self.assertEqual(exit_code([], 2), 2)
+        self.assertEqual(exit_code([ok(1)], 0), 2)                             # oracle không liệt kê được giai đoạn nào
+
+
+# ---------------------------------------------------------------- bí mật và quyền duyệt
+class EnvScrubTests(unittest.TestCase):
+    def test_clean_env_drops_secret_looking_names_only(self):
+        from harness.sandbox import clean_env
+        env = {"PATH": "/bin", "HOME": "/h", "LANG": "C", "GIT_AUTHOR_NAME": "bạn", "PYTHONPATH": "/x",
+               "GITHUB_TOKEN": "1", "OPENAI_API_KEY": "1", "AWS_SECRET_ACCESS_KEY": "1", "AWS_ACCESS_KEY_ID": "1",
+               "DB_PASSWORD": "1", "SSH_AUTH_SOCK": "1", "MY_SERVICE_KEY": "1", "SESSION_COOKIE": "1"}
+        self.assertEqual(sorted(clean_env(env)), ["GIT_AUTHOR_NAME", "HOME", "LANG", "PATH", "PYTHONPATH"])
+
+    def test_allow_list_keeps_named_variables(self):
+        from harness.sandbox import clean_env
+        env = {"OPENAI_API_KEY": "1", "DB_PASSWORD": "1", "GITHUB_TOKEN": "1", "HARNESS_ENV_ALLOW": "OPENAI_API_KEY, DB_PASSWORD"}
+        self.assertEqual(sorted(k for k in clean_env(env) if k != "HARNESS_ENV_ALLOW"), ["DB_PASSWORD", "OPENAI_API_KEY"])
+
+    @unittest.skipUnless(__import__("harness.sandbox", fromlist=["x"]).available(), "kernel không có Landlock")
+    def test_bash_does_not_see_secret_env_unless_unsandboxed(self):
+        import os
+        from unittest import mock
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup); ws = Workspace(d.name)
+        show = 'echo "[${FAKE_API_KEY:-vắng}]"'
+        with mock.patch.dict(os.environ, {"FAKE_API_KEY": "s3cr3t-value"}):
+            self.assertIn("[vắng]", build_tools(ws)["bash"].fn(show))
+            self.assertIn("[s3cr3t-value]", build_tools(ws, sandbox=False)["bash"].fn(show))
+            with mock.patch.dict(os.environ, {"HARNESS_ENV_ALLOW": "FAKE_API_KEY"}):
+                self.assertIn("[s3cr3t-value]", build_tools(ws)["bash"].fn(show))
+
+
+class ApprovalTests(unittest.TestCase):
+    def test_web_tools_need_approval(self):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        tools = build_tools(Workspace(d.name))
+        for name in ("web_search", "web_fetch", "bash", "write_file"):
+            self.assertTrue(tools[name].needs_approval, name)
+        for name in ("read_file", "grep", "todo"):
+            self.assertFalse(tools[name].needs_approval, name)
+
+    def test_subagent_inherits_ask_mode(self):
+        """--ask: subagent do `delegate` tạo ra cũng phải hỏi trước khi chạm web, không được lách quyền duyệt."""
+        from harness.agent import delegate_tool
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup); ws = Workspace(d.name)
+        asked = []
+        client = FakeClient([Reply(tool_calls=[{"id": "1", "name": "web_fetch", "arguments": {"url": "http://example.invalid/"}}]),
+                             Reply(content="bị từ chối")])
+        parent = Agent(client, build_tools(ws), ws, ui=UI(io.StringIO()), auto_approve=False,
+                       approve=lambda name, args: asked.append(name) or False)
+        self.assertEqual(delegate_tool(parent).fn(task="đọc trang web"), "bị từ chối")
+        self.assertEqual(asked, ["web_fetch"])
+
+
+class ReplSurvivesServerErrorTest(unittest.TestCase):
+    def test_repl_reports_error_and_keeps_going(self):
+        """Server ngắt kết nối giữa lượt: REPL báo lỗi, bỏ tin nhắn treo, vẫn nhận câu kế và thoát bằng /exit (mã 0)."""
+        import contextlib
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from unittest import mock
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self):
+                if self.path == "/v1/models":
+                    body = json.dumps({"data": [{"id": "fake"}]}).encode()
+                    self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+                else:
+                    self.send_response(404); self.end_headers()
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+                self.connection.close()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close); self.addCleanup(srv.shutdown)
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+
+        from harness import cli
+        out = io.StringIO()
+        with mock.patch.object(cli, "load_mcp_tools", lambda *a, **k: ({}, [])), \
+                mock.patch.object(Agent, "NET_RETRY_DELAY", 0), \
+                mock.patch("builtins.input", side_effect=["chào", "xin chào lần hai", "/exit"]) as inp, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = cli.main(["--host", f"http://127.0.0.1:{srv.server_port}", "-m", "fake", "-C", d.name, "--no-memory", "--no-embed"])
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertEqual(inp.call_count, 3)   # sau lỗi lượt 1, vẫn hỏi tiếp lượt 2 rồi mới /exit
+        self.assertEqual(out.getvalue().count("gõ lại"), 2)

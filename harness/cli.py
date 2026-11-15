@@ -163,6 +163,12 @@ def run(a) -> int:
     agent, mcp_servers = make_agent(a, client, ctx, ws, ui, memory, extra)
     sess_dir = ws.root / ".harness" / "sessions"
     save = lambda: [agent.save(sess_dir / f"{n}.json") for n in ("last", a.session) if n]
+
+    def save_quietly():
+        try:
+            save()
+        except OSError:
+            pass   # không để lỗi ghi đĩa che mất lỗi gốc
     try:
         if a.resume:
             if agent.load(sess_dir / f"{a.resume}.json"):
@@ -170,7 +176,7 @@ def run(a) -> int:
             else:
                 ui.error(f"không tìm thấy phiên '{a.resume}' trong {sess_dir}")
         if a.stages:
-            from .stages import Oracle, report as stage_report, run_stages
+            from .stages import Oracle, exit_code, report as stage_report, run_stages
             if not a.oracle:
                 ui.error("--stages cần --oracle SCRIPT")
                 return 1
@@ -180,14 +186,17 @@ def run(a) -> int:
                     out = agent.tools["bash"].fn(a.verify)
                     m = re.search(r"\[exit (\d+)\]\s*$", out)
                     return bool(m and m.group(1) == "0"), out
-            results = run_stages(agent, Oracle(a.oracle, ws.root), a.step_budget, a.stage_rounds, a.start_stage,
+            oracle = Oracle(a.oracle, ws.root)
+            last_stage = max((s["id"] for s in oracle.list_stages()), default=0)
+            results = run_stages(agent, oracle, a.step_budget, a.stage_rounds, a.start_stage,
                                  unit_verify=unit, on_stage_done=save)
             save()
             ui.w("\n" + stage_report(results))
-            return 0 if results and all(r.ok for r in results) and results[-1].id >= 7 else 2
+            return exit_code(results, last_stage)
         if a.goal:
             from .goal import report, run_goal
-            results = run_goal(agent, a.goal, a.step_budget, a.max_items, require_tests=not a.no_require_tests)
+            results = run_goal(agent, a.goal, a.step_budget, a.max_items, require_tests=not a.no_require_tests,
+                               on_item_done=save)
             save()
             ui.w("\n" + report(results))
             return 0 if results and all(r.status == "done" for r in results) else 2
@@ -230,8 +239,14 @@ def run(a) -> int:
                 save()
             except KeyboardInterrupt:
                 ui.w(ui.c("muted", "\n[đã ngắt]"))
+            except LLMError as e:   # server lỗi giữa chừng: báo rồi cho gõ tiếp, đừng đóng cả phiên
+                ui.error(str(e))
+                if agent.drop_dangling_turn():
+                    ui.w(ui.c("muted", "(lượt này chưa được xử lý, hãy gõ lại)"))
+                save_quietly()
     except LLMError as e:
         ui.error(str(e))
+        save_quietly()   # giữ lại những gì đã làm để --resume
         return 1
     finally:
         for s in mcp_servers:

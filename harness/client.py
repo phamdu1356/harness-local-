@@ -1,6 +1,7 @@
 """Client cho server OpenAI-compatible (LM Studio: http://localhost:1234/v1), stdlib, streaming."""
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import urllib.error
@@ -20,7 +21,11 @@ class Reply:
 
 
 class LLMError(RuntimeError):
-    pass
+    """Lỗi khi nói chuyện với server model. transient=True: lỗi đường truyền (đứt/quá hạn/luồng hỏng) đáng thử lại một lần."""
+
+    def __init__(self, msg: str = "", transient: bool = False):
+        super().__init__(msg)
+        self.transient = transient
 
 
 MAX_THINK_CHARS = 14000
@@ -92,13 +97,16 @@ class LMStudioClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 for raw in resp:
-                    line = raw.decode().strip()
+                    line = raw.decode(errors="replace").strip()
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-                    chunk = json.loads(data)
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError as e:
+                        raise LLMError(f"Server trả dòng stream hỏng: {data[:80]!r}", transient=True) from e
                     if "error" in chunk:
                         raise LLMError(str(chunk["error"]))
                     if u := chunk.get("usage"):
@@ -130,9 +138,16 @@ class LMStudioClient:
                     if reply.aborted:
                         break
         except urllib.error.HTTPError as e:
-            raise LLMError(f"HTTP {e.code}: {e.read().decode(errors='replace')}") from e
+            try:
+                body = e.read().decode(errors="replace")
+            finally:
+                e.close()
+            raise LLMError(f"HTTP {e.code}: {body}") from e
         except urllib.error.URLError as e:
-            raise LLMError(f"Mất kết nối LM Studio tại {self.host}: {e.reason}") from e
+            raise LLMError(f"Mất kết nối LM Studio tại {self.host}: {e.reason}", transient=True) from e
+        except (OSError, http.client.HTTPException) as e:   # quá hạn, bị ngắt giữa chừng khi đang stream (server chết/OOM)
+            raise LLMError(f"Đứt kết nối với server model tại {self.host} khi đang nhận câu trả lời: "
+                           f"{type(e).__name__}: {e}", transient=True) from e
         for i in sorted(partial):
             p = partial[i]
             try:
