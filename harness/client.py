@@ -30,6 +30,7 @@ class LLMError(RuntimeError):
 
 MAX_THINK_CHARS = 14000
 _SEG_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+_EMBED_RX = re.compile(r"embed|(?:bge|e5|gte)[-_]|minilm|nomic-embed|arctic-embed", re.I)
 
 
 def detect_repetition(text: str, repeats: int = 3) -> bool:
@@ -55,10 +56,21 @@ class LMStudioClient:
     def list_models(self) -> list[str]:
         try:
             with urllib.request.urlopen(f"{self.host}/v1/models", timeout=5) as r:
-                return [m["id"] for m in json.load(r).get("data", [])]
-        except (urllib.error.URLError, OSError) as e:
+                data = json.load(r)
+            if not isinstance(data, dict) or not isinstance(data.get("data", []), list):
+                raise LLMError(f"Server {self.host}/v1/models trả dữ liệu không hợp lệ.")
+            return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and isinstance(m.get("id"), str)]
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode(errors="replace")
+            finally:
+                e.close()
+            raise LLMError(f"HTTP {e.code} từ {self.host}/v1/models: {body}") from e
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
             raise LLMError(f"Không kết nối được LM Studio tại {self.host}. "
                            "Mở LM Studio → tab Developer → Start Server.") from e
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as e:
+            raise LLMError(f"Server {self.host}/v1/models trả JSON hỏng: {e}") from e
 
     def context_length(self) -> int | None:
         """Context đang nạp của model: LM Studio (/api/v0/models) hoặc llama-server (/props)."""
@@ -71,13 +83,16 @@ class LMStudioClient:
                 with urllib.request.urlopen(f"{self.host}{path}", timeout=3) as r:
                     if n := pick(json.load(r)):
                         return int(n)
+            except urllib.error.HTTPError as e:
+                e.close()
+                continue
             except Exception:
                 continue
         return None
 
     def ensure_model(self) -> str:
         if not self.model:  # dùng model đầu tiên đang load trong LM Studio
-            models = [m for m in self.list_models() if "embed" not in m]
+            models = [m for m in self.list_models() if not _EMBED_RX.search(m)]
             if not models:
                 raise LLMError("LM Studio chưa có model nào được load.")
             self.model = models[0]
@@ -91,7 +106,7 @@ class LMStudioClient:
         if tools:
             body["tools"] = tools
         req = urllib.request.Request(
-            f"{self.host}/v1/chat/completions", data=json.dumps(body).encode(),
+            f"{self.host}/v1/chat/completions", data=json.dumps(body, ensure_ascii=False).encode(),
             headers={"Content-Type": "application/json"})
         reply, partial, checked = Reply(), {}, 0  # partial: index -> {id, name, args(str)}
         try:
@@ -107,13 +122,20 @@ class LMStudioClient:
                         chunk = json.loads(data)
                     except json.JSONDecodeError as e:
                         raise LLMError(f"Server trả dòng stream hỏng: {data[:80]!r}", transient=True) from e
-                    if "error" in chunk:
+                    if not isinstance(chunk, dict):
+                        continue
+                    if chunk.get("error"):
                         raise LLMError(str(chunk["error"]))
-                    if u := chunk.get("usage"):
-                        reply.prompt_tokens = u.get("prompt_tokens", 0)
-                        reply.completion_tokens = u.get("completion_tokens", 0)
-                    for choice in chunk.get("choices", []):
-                        d = choice.get("delta", {})
+                    u = chunk.get("usage")
+                    if isinstance(u, dict):
+                        reply.prompt_tokens = u.get("prompt_tokens") or 0
+                        reply.completion_tokens = u.get("completion_tokens") or 0
+                    for choice in chunk.get("choices") or []:
+                        if not isinstance(choice, dict):
+                            continue
+                        d = choice.get("delta") or {}
+                        if not isinstance(d, dict):
+                            continue
                         if t := d.get("reasoning_content") or d.get("reasoning"):
                             reply.thinking += t
                             if on_thinking:
@@ -123,11 +145,22 @@ class LMStudioClient:
                             if on_token:
                                 on_token(c)
                         for tc in d.get("tool_calls") or []:
-                            p = partial.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
+                            if not isinstance(tc, dict):
+                                continue
+                            idx = tc.get("index")
+                            if not isinstance(idx, int) or isinstance(idx, bool):
+                                idx = 0
+                            p = partial.setdefault(idx, {"id": "", "name": "", "args": ""})
                             p["id"] = tc.get("id") or p["id"]
-                            fn = tc.get("function", {})
+                            fn = tc.get("function") or {}
+                            if not isinstance(fn, dict):
+                                fn = {}
                             p["name"] += fn.get("name") or ""
-                            p["args"] += fn.get("arguments") or ""
+                            raw_args = fn.get("arguments")
+                            if isinstance(raw_args, dict):
+                                p["args"] += json.dumps(raw_args, ensure_ascii=False)
+                            elif isinstance(raw_args, str):
+                                p["args"] += raw_args
                     seen = len(reply.thinking) + len(reply.content)
                     if seen - checked >= 200:     # kiểm tra mỗi ~200 ký tự mới, không phải từng chunk
                         checked = seen
@@ -150,9 +183,26 @@ class LMStudioClient:
                            f"{type(e).__name__}: {e}", transient=True) from e
         for i in sorted(partial):
             p = partial[i]
-            try:
-                args = json.loads(p["args"]) if p["args"].strip() else {}
-            except json.JSONDecodeError:
+            raw_s = p["args"].strip()
+            arg_error = ""
+            if not raw_s:
                 args = {}
-            reply.tool_calls.append({"id": p["id"] or f"call_{i}", "name": p["name"], "arguments": args})
+            else:
+                try:
+                    parsed = json.loads(raw_s)
+                    if parsed is None:
+                        args = {}
+                    elif isinstance(parsed, dict):
+                        args = parsed
+                    else:
+                        args = {}
+                        arg_error = f"tham số tool phải là object JSON, nhận {type(parsed).__name__}: {raw_s[:120]}"
+                except json.JSONDecodeError as e:
+                    args = {}
+                    arg_error = f"JSON tham số tool hỏng ({e.msg}): {raw_s[:120]}"
+            tc_item = {"id": p["id"] or f"call_{i}", "name": p["name"], "arguments": args}
+            if arg_error:
+                tc_item["arg_error"] = arg_error
+                tc_item["raw_arguments"] = p["args"]
+            reply.tool_calls.append(tc_item)
         return reply

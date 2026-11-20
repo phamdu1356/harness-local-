@@ -83,7 +83,7 @@ class UI:
             self.spinner_stop()
             self.w(self.c("muted", "┊ suy nghĩ"))
             self._phase = "think"
-        self.w(self.c("think", text.replace("\n", "\n")), end="")
+        self.w(self.c("think", text), end="")
 
     def stream_answer(self, text: str):
         if self._phase != "answer":
@@ -103,9 +103,12 @@ class UI:
 
     def tool_call(self, name: str, args: dict):
         self.end_stream()
-        main = next(iter(args.values()), "") if args else ""
-        summary = clip(str(main).replace("\n", " ⏎ "), 90) if len(args) <= 1 else clip(
-            json.dumps(args, ensure_ascii=False).replace("\\n", " ⏎ "), 90)
+        if isinstance(args, dict):
+            main = next(iter(args.values()), "") if args else ""
+            summary = clip(str(main).replace("\n", " ⏎ "), 90) if len(args) <= 1 else clip(
+                json.dumps(args, ensure_ascii=False).replace("\\n", " ⏎ "), 90)
+        else:
+            summary = clip(str(args).replace("\n", " ⏎ "), 90)
         self.w(f"{self.c('tool', '▸')} {self.c('bold', name)} {self.c('muted', summary)}")
 
     def tool_result(self, result: str, max_lines: int = 6):
@@ -120,7 +123,7 @@ class UI:
             self.w("   " + self.c("muted", f"… +{len(lines) - max_lines} dòng"))
 
     def ask_approval(self, name: str, args: dict) -> str:
-        detail = args.get("command") or args.get("path") or json.dumps(args, ensure_ascii=False)
+        detail = (args.get("command") or args.get("path") or json.dumps(args, ensure_ascii=False)) if isinstance(args, dict) else str(args)
         self.end_stream()
         return f"{self.c('warn', '⚠')} cho phép {self.c('bold', name)} {self.c('muted', clip(str(detail), 120))} {self.c('dim', '[y/N]')} "
 

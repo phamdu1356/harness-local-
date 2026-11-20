@@ -7,6 +7,8 @@ import re
 import sys
 import uuid
 
+from pathlib import Path
+
 from .agent import Agent, delegate_tool
 from .client import LLMError, LMStudioClient
 from .embed import EmbedClient
@@ -62,7 +64,7 @@ def backends(a):
             a.local = ""
         if a.local is not None:
             server = LocalServer(find_model(a.local or None), a.port, a.ctx or DEFAULT_CTX, reasoning=a.think,
-                                 effort=a.effort, cpu=a.cpu, threads=(a.threads or 8) if a.cpu else 0)
+                                 effort=a.effort, cpu=a.cpu, threads=a.threads or (8 if a.cpu else 0))
             print(f"Khởi động llama-server ({'CPU' if a.cpu else 'GPU'}) · {server.model.name} · ctx {server.ctx}"
                   " ... (nạp model có thể mất 10–60s)", flush=True)
             servers.append(server)
@@ -117,13 +119,14 @@ def make_agent(a, client, ctx: int, ws: Workspace, ui: UI, memory: Memory | None
     return agent, servers
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] == "eval":
-        from .evals import main as eval_main
-        return eval_main(argv[1:])
-    ap = argparse.ArgumentParser(prog="harness", parents=[common_parser()],
-                                 description="Agent coding CLI cho LLM local (LM Studio / llama-server)")
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="harness",
+        parents=[common_parser()],
+        description="Agent coding CLI cho LLM local (LM Studio / llama-server)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Lệnh con:\n  eval [CỜ]            chạy bộ đánh giá tự động (xem: harness eval --help)",
+    )
     ap.add_argument("-C", "--cwd", default=".", help="workspace (mặc định: thư mục hiện tại)")
     ap.add_argument("-p", "--prompt", help="chạy một lần rồi thoát")
     ap.add_argument("--ask", action="store_true", help="hỏi duyệt trước khi ghi/xoá/chạy lệnh (mặc định: toàn quyền)")
@@ -139,7 +142,73 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stage-rounds", type=int, default=4, help="số vòng sửa tối đa cho mỗi giai đoạn")
     ap.add_argument("--resume", nargs="?", const="last", metavar="TÊN", help="mở lại phiên đã lưu (mặc định: phiên gần nhất)")
     ap.add_argument("--session", metavar="TÊN", help="lưu phiên này thêm dưới tên TÊN")
+    return ap
+
+
+def _extract_eval_argv(ap: argparse.ArgumentParser, argv: list[str]) -> list[str] | None:
+    if argv and argv[0] == "eval":
+        return argv[1:]
+    opt_map = {opt: act for act in ap._actions for opt in act.option_strings}
+    no_val = (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse._HelpAction,
+              argparse._CountAction, argparse._VersionAction)
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return None
+        if tok == "eval":
+            return argv[:i] + argv[i + 1:]
+        if tok.startswith("-") and "=" not in tok:
+            act = opt_map.get(tok)
+            if act and not isinstance(act, no_val):
+                if act.nargs is None:
+                    i += 2
+                    continue
+                if act.nargs == "?" and i + 1 < len(argv) and not argv[i + 1].startswith("-") and argv[i + 1] != "eval":
+                    i += 2
+                    continue
+        i += 1
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    ap = _build_parser()
+    eval_argv = _extract_eval_argv(ap, argv)
+    if eval_argv is not None:
+        from .evals import main as eval_main
+        return eval_main(eval_argv)
     a = ap.parse_args(argv)
+    if a.threads < 0:
+        ap.error("--threads phải >= 0")
+    if a.threads and not a.cpu and a.local is None:
+        print("⚠ --threads chỉ có tác dụng khi dùng --local hoặc --cpu; đang bỏ qua.", file=sys.stderr)
+    extra = a.system or ""
+    if extra.startswith("@"):
+        try:
+            extra = Path(extra[1:]).read_text()
+        except OSError as e:
+            print(f"✗ Không đọc được file --system '{extra[1:]}': {e}", file=sys.stderr)
+            return 1
+    a._system_text = extra
+    if a.oracle and not a.stages:
+        print("✗ --oracle chỉ dùng cùng --stages", file=sys.stderr)
+        return 1
+    if a.stages:
+        if not a.oracle:
+            print("✗ --stages cần --oracle SCRIPT", file=sys.stderr)
+            return 1
+        from .stages import Oracle, OracleError
+        try:
+            a._stages = Oracle(a.oracle, Path(a.cwd).resolve()).list_stages()
+        except OracleError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return 1
+    if a.resume:
+        sess_path = Path(a.cwd).resolve() / ".harness" / "sessions" / f"{a.resume}.json"
+        if not sess_path.is_file() or Agent._parse_session(sess_path) is None:
+            print(f"✗ Không tìm thấy hoặc hỏng phiên '{a.resume}' trong {sess_path.parent}", file=sys.stderr)
+            return 1
     try:
         with backends(a):
             return run(a)
@@ -148,35 +217,59 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def _ensure_harness_gitignore(root: Path) -> None:
+    gi = root / ".harness" / ".gitignore"
+    if not gi.exists():
+        gi.parent.mkdir(parents=True, exist_ok=True)
+        gi.write_text("*\n")
+
+
 def run(a) -> int:
     ws = Workspace(a.cwd)
     ui = UI()
+    if hasattr(a, "_system_text"):
+        extra = a._system_text
+    else:
+        extra = a.system or ""
+        if extra.startswith("@"):
+            try:
+                extra = Path(extra[1:]).read_text()
+            except OSError as e:
+                ui.error(f"không đọc được file --system '{extra[1:]}': {e}")
+                return 1
     client, ctx = make_client(a)
     memory = None if a.no_memory else Memory(ws.root / ".harness" / "memory.db", uuid.uuid4().hex[:8], a.embedder)
-    extra = a.system or ""
-    if extra.startswith("@"):
-        extra = open(extra[1:]).read()
-    if memory and memory.embedder:
-        n = memory.backfill()
-        if n:
-            ui.w(ui.c("muted", f"◌ đã nhúng bù {n} mục cũ vào bộ nhớ"))
-    agent, mcp_servers = make_agent(a, client, ctx, ws, ui, memory, extra)
+    mcp_servers: list = []
     sess_dir = ws.root / ".harness" / "sessions"
-    save = lambda: [agent.save(sess_dir / f"{n}.json") for n in ("last", a.session) if n]
-
-    def save_quietly():
-        try:
-            save()
-        except OSError:
-            pass   # không để lỗi ghi đĩa che mất lỗi gốc
+    save = lambda: None
+    save_quietly = lambda: None
     try:
+        if memory and memory.embedder:
+            n = memory.backfill()
+            if n:
+                ui.w(ui.c("muted", f"◌ đã nhúng bù {n} mục cũ vào bộ nhớ"))
+        agent, mcp_servers = make_agent(a, client, ctx, ws, ui, memory, extra)
+
+        def save():
+            _ensure_harness_gitignore(ws.root)
+            for n in ("last", a.session):
+                if n:
+                    agent.save(sess_dir / f"{n}.json")
+
+        def save_quietly():
+            try:
+                save()
+            except OSError:
+                pass   # không để lỗi ghi đĩa che mất lỗi gốc
+
         if a.resume:
             if agent.load(sess_dir / f"{a.resume}.json"):
                 ui.w(ui.c("muted", f"◌ đã mở lại phiên '{a.resume}' ({agent.turn} lượt)"))
             else:
-                ui.error(f"không tìm thấy phiên '{a.resume}' trong {sess_dir}")
+                ui.error(f"không tìm thấy hoặc hỏng phiên '{a.resume}' trong {sess_dir}")
+                return 1
         if a.stages:
-            from .stages import Oracle, exit_code, report as stage_report, run_stages
+            from .stages import Oracle, OracleError, exit_code, report as stage_report, run_stages
             if not a.oracle:
                 ui.error("--stages cần --oracle SCRIPT")
                 return 1
@@ -187,9 +280,14 @@ def run(a) -> int:
                     m = re.search(r"\[exit (\d+)\]\s*$", out)
                     return bool(m and m.group(1) == "0"), out
             oracle = Oracle(a.oracle, ws.root)
-            last_stage = max((s["id"] for s in oracle.list_stages()), default=0)
+            try:
+                stages_list = a._stages if hasattr(a, "_stages") else oracle.list_stages()
+            except OracleError as e:
+                ui.error(str(e))
+                return 1
+            last_stage = max((s["id"] for s in stages_list), default=0)
             results = run_stages(agent, oracle, a.step_budget, a.stage_rounds, a.start_stage,
-                                 unit_verify=unit, on_stage_done=save)
+                                 unit_verify=unit, on_stage_done=save, stages=stages_list)
             save()
             ui.w("\n" + stage_report(results))
             return exit_code(results, last_stage)
@@ -199,10 +297,12 @@ def run(a) -> int:
                                on_item_done=save)
             save()
             ui.w("\n" + report(results))
-            return 0 if results and all(r.status == "done" for r in results) else 2
+            return 0 if results and all(r.status == "done" for r in results) and getattr(results, "final_ok", True) else 2
         if a.prompt:
             agent.run(a.prompt)
             save()
+            if agent.exhausted or (agent.verify and getattr(agent, "last_verify_ok", None) is not True):
+                return 2
             return 0
         ui.banner(client.model, str(ws.root))
         while True:
@@ -232,25 +332,33 @@ def run(a) -> int:
                 continue
             if line == "/clear":
                 agent.reset()
+                save_quietly()
                 ui.w(ui.c("muted", "Đã xoá hội thoại."))
                 continue
             try:
                 agent.run(line)
                 save()
             except KeyboardInterrupt:
+                agent.cleanup_interrupted()
+                save_quietly()
                 ui.w(ui.c("muted", "\n[đã ngắt]"))
             except LLMError as e:   # server lỗi giữa chừng: báo rồi cho gõ tiếp, đừng đóng cả phiên
                 ui.error(str(e))
                 if agent.drop_dangling_turn():
                     ui.w(ui.c("muted", "(lượt này chưa được xử lý, hãy gõ lại)"))
+                else:
+                    agent.cleanup_interrupted()
                 save_quietly()
     except LLMError as e:
+        agent.cleanup_interrupted()
         ui.error(str(e))
         save_quietly()   # giữ lại những gì đã làm để --resume
         return 1
     finally:
         for s in mcp_servers:
             s.stop()
+        if memory:
+            memory.close()
 
 
 if __name__ == "__main__":

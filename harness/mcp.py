@@ -38,17 +38,29 @@ class MCPServer:
                                          stderr=subprocess.DEVNULL, text=True, bufsize=1, env=self.env, cwd=self.cwd)
         except OSError as e:
             raise MCPError(f"không chạy được {self.cmd[0]}: {e}") from e
-        threading.Thread(target=self._reader, daemon=True).start()
-        self.request("initialize", {"protocolVersion": PROTOCOL, "capabilities": {},
-                                    "clientInfo": {"name": "harness", "version": "0.1"}})
-        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        try:
+            self._reader_thread = threading.Thread(target=self._reader, daemon=True)
+            self._reader_thread.start()
+            self.request("initialize", {"protocolVersion": PROTOCOL, "capabilities": {},
+                                        "clientInfo": {"name": "harness", "version": "0.1"}})
+            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except Exception:
+            self.stop()
+            raise
 
     def _reader(self) -> None:
-        for line in self.proc.stdout:
-            try:
-                self._q.put(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+        proc = self.proc
+        if not proc or not proc.stdout:
+            self._q.put(None)
+            return
+        try:
+            for line in proc.stdout:
+                try:
+                    self._q.put(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except (ValueError, OSError):
+            pass
         self._q.put(None)  # server đóng stdout
 
     def _send(self, obj: dict) -> None:
@@ -92,12 +104,32 @@ class MCPServer:
         return clip(("LỖI: " if res.get("isError") else "") + text)
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        proc = self.proc
+        if not proc:
+            return
+        self.proc = None
+        try:
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(2)
+            t = getattr(self, "_reader_thread", None)
+            if t and t.is_alive():
+                t.join(timeout=1)
+        finally:
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
 
 
 def _wrap(server: MCPServer, spec: dict) -> Tool:
@@ -106,8 +138,26 @@ def _wrap(server: MCPServer, spec: dict) -> Tool:
     params = {}
     for k, v in (schema.get("properties") or {}).items():
         v = dict(v) if isinstance(v, dict) else {}
-        if not isinstance(v.get("type"), str):
-            v["type"] = "string"
+        t = v.get("type")
+        nullable = False
+        if isinstance(t, list):
+            nullable = "null" in t
+            non_null = [x for x in t if isinstance(x, str) and x != "null"]
+            t = non_null[0] if len(non_null) == 1 else "string"
+        elif not isinstance(t, str):
+            variants = v.get("anyOf") or v.get("oneOf")
+            if isinstance(variants, list):
+                types = [x.get("type") for x in variants if isinstance(x, dict) and isinstance(x.get("type"), str)]
+                nullable = "null" in types
+                non_null = [x for x in types if x != "null"]
+                t = non_null[0] if len(non_null) == 1 else "string"
+                v.pop("anyOf", None)
+                v.pop("oneOf", None)
+            else:
+                t = "string"
+        v["type"] = t
+        if nullable:
+            v["nullable"] = True
         params[k] = {**v, "optional": k not in required}
     name = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{server.name}__{spec['name']}")[:64]
     desc = f"[MCP {server.name}] {spec.get('description', spec['name'])}"
@@ -118,7 +168,10 @@ def load_config(ws_root: Path) -> dict:
     for p in (ws_root / ".harness" / "mcp.json", Path.home() / ".config" / "harness" / "mcp.json"):
         if p.is_file():
             data = json.loads(p.read_text())
-            return data.get("mcpServers") or data.get("servers") or {}
+            if not isinstance(data, dict):
+                raise MCPError("mcp.json phải là object")
+            cfg = data.get("mcpServers") if "mcpServers" in data else data.get("servers")
+            return {} if cfg is None else cfg
     return {}
 
 
@@ -127,18 +180,34 @@ def load_mcp_tools(ws_root: Path, warn=print) -> tuple[dict[str, Tool], list[MCP
     servers: list[MCPServer] = []
     try:
         cfg = load_config(ws_root)
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, MCPError) as e:
         warn(f"⚠ mcp.json lỗi: {e}")
         return tools, servers
+    if not isinstance(cfg, dict):
+        warn("⚠ mcp.json lỗi: mcpServers phải là object")
+        return tools, servers
     for name, c in cfg.items():
-        srv = MCPServer(name, c["command"], c.get("args"), c.get("env"), str(ws_root))
+        srv = None
         try:
+            if not isinstance(c, dict):
+                raise MCPError("cấu hình server phải là object")
+            cmd = c["command"]
+            if not isinstance(cmd, str) or not cmd.strip():
+                raise MCPError("command phải là chuỗi khác rỗng")
+            args = c.get("args")
+            if args is not None and not isinstance(args, list):
+                raise MCPError("args phải là mảng")
+            env = c.get("env")
+            if env is not None and not isinstance(env, dict):
+                raise MCPError("env phải là object")
+            srv = MCPServer(name, cmd, args, env, str(ws_root))
             srv.start()
             for spec in srv.list_tools():
                 t = _wrap(srv, spec)
                 tools[t.name] = t
             servers.append(srv)
-        except (MCPError, KeyError) as e:
+        except (MCPError, KeyError, TypeError) as e:
             warn(f"⚠ MCP {name}: {e}")
-            srv.stop()
+            if srv:
+                srv.stop()
     return tools, servers

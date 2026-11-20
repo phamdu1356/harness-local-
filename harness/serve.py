@@ -4,6 +4,7 @@ Tìm binary: PATH, hoặc backend CUDA mới nhất của LM Studio. Tìm model:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -21,7 +22,11 @@ class ServeError(RuntimeError):
 
 
 def _version(p: Path) -> tuple:
-    return tuple(int(x) for x in re.findall(r"\d+", p.parent.name.rsplit("-", 1)[-1]))
+    name = p.parent.name
+    if m := re.search(r"(?:^|[-_])(?:v|b)(\d+(?:\.\d+)*)", name, re.I):
+        return tuple(int(x) for x in m.group(1).split("."))
+    cleaned = re.sub(r"(?:cuda\d*|vulkan\d*|x86_64|arm64|aarch64)", "", name, flags=re.I)
+    return tuple(int(x) for x in re.findall(r"\d+", cleaned))
 
 
 def find_server(cpu: bool = False) -> tuple[str, dict]:
@@ -49,16 +54,26 @@ def find_server(cpu: bool = False) -> tuple[str, dict]:
             libs.append(str(backends / "vendor" / f"linux-llama-{v}-vendor-v1"))
     if "cuda" in best.parent.name and "cuda1" not in best.parent.name:
         libs.append(str(backends / "vendor" / "linux-llama-cuda-vendor-v1"))
-    env["LD_LIBRARY_PATH"] = ":".join(libs + [env.get("LD_LIBRARY_PATH", "")])
+    old_ld = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = ":".join(libs + ([old_ld] if old_ld else []))
     return str(best), env
 
 
-EMBED_RX = re.compile(r"embed|bge-|e5-|gte-|minilm|nomic-embed|arctic-embed", re.I)
+EMBED_RX = re.compile(r"embed|(?:bge|e5|gte)[-_]|minilm|nomic-embed|arctic-embed", re.I)
 
 
 def _ggufs(embedding: bool) -> list[Path]:
-    return [p for p in (LMS / "models").rglob("*.gguf")
-            if "mmproj" not in p.name.lower() and bool(EMBED_RX.search(p.name)) == embedding]
+    models_dir = LMS / "models"
+    if not models_dir.exists():
+        return []
+    out = []
+    for p in models_dir.rglob("*.gguf"):
+        if "mmproj" in p.name.lower():
+            continue
+        rel = str(p.relative_to(models_dir))
+        if bool(EMBED_RX.search(rel)) == embedding:
+            out.append(p)
+    return sorted(out)
 
 
 def find_embed_model(spec: str | None = None) -> Path:
@@ -105,17 +120,28 @@ class LocalServer:
     def healthy(self) -> bool:
         try:
             with urllib.request.urlopen(f"{self.host}/health", timeout=1) as r:
-                return r.status == 200
-        except Exception:
+                if r.status != 200:
+                    return False
+                body = r.read().decode(errors="replace").strip()
+                if not body:
+                    return False
+                try:
+                    data = json.loads(body)
+                    return isinstance(data, dict) and data.get("status") == "ok"
+                except json.JSONDecodeError:
+                    return body.lower() == "ok"
+        except Exception as e:
+            if hasattr(e, "close"):
+                e.close()
             return False
 
     def start(self, timeout: int = 180) -> None:
         if self.healthy():
             return  # đã có server chạy sẵn trên cổng này
         binary, env = find_server(self.cpu)
-        logf = open(self.log, "w")
-        self.proc = subprocess.Popen(self.command(binary), env=env, stdout=logf, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, start_new_session=True)
+        with open(self.log, "w") as logf:
+            self.proc = subprocess.Popen(self.command(binary), env=env, stdout=logf, stderr=subprocess.STDOUT,
+                                         stdin=subprocess.DEVNULL, start_new_session=True)
         t0 = time.time()
         while time.time() - t0 < timeout:
             if self.proc.poll() is not None:
@@ -134,6 +160,7 @@ class LocalServer:
                 self.proc.wait(10)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                self.proc.wait(2)
 
 
 class EmbedServer(LocalServer):

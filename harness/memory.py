@@ -27,12 +27,18 @@ def fold(t: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", t.lower().replace("đ", "d")) if unicodedata.category(c) != "Mn")
 
 
+STOP_FOLDED = {fold(w) for w in STOP}
+
+
 def lexically_strong(content: str, query: str) -> bool:
     """Có từ khoá (≥3 ký tự, không phải từ phổ biến) của câu hỏi xuất hiện nguyên vẹn trong nội dung.
     Câu hỏi gõ không dấu thì so sánh sau khi bỏ dấu."""
-    norm = fold if query == fold(query) else str.lower
+    q_low = query.lower()
+    unaccented = q_low == fold(q_low)
+    norm = fold if unaccented else str.lower
+    stop = STOP_FOLDED if unaccented else STOP
     words = set(re.findall(r"\w+", norm(content)))
-    return any(len(w) >= 3 and w not in STOP and w in words for w in re.findall(r"\w+", norm(query)))
+    return any(len(w) >= 3 and w not in stop and w in words for w in re.findall(r"\w+", norm(query)))
 
 
 @dataclass
@@ -74,6 +80,13 @@ def _chunks(text: str, size: int = CHUNK) -> list[str]:
     return [c.strip() for c in out if c.strip()]
 
 
+_MEM_DDL = (
+    'CREATE VIRTUAL TABLE IF NOT EXISTS mem USING fts5('
+    'content UNINDEXED, folded, kind UNINDEXED, session UNINDEXED, turn UNINDEXED, ts UNINDEXED, '
+    'tokenize="unicode61 remove_diacritics 2")'
+)
+
+
 class Memory:
     def __init__(self, path: str | Path = ":memory:", session: str = "s0", embedder=None):
         self.session, self.embedder = session, embedder
@@ -83,12 +96,31 @@ class Memory:
             if not gi.exists():
                 gi.write_text("*\n")
         self.db = sqlite3.connect(str(path))
-        self.db.execute('CREATE VIRTUAL TABLE IF NOT EXISTS mem USING fts5('
-                        'content, kind UNINDEXED, session UNINDEXED, turn UNINDEXED, ts UNINDEXED, '
-                        'tokenize="unicode61 remove_diacritics 2")')
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(mem)").fetchall()]
+        if cols and "folded" not in cols:
+            old = self.db.execute("SELECT rowid, content, kind, session, turn, ts FROM mem").fetchall()
+            self.db.execute("DROP TABLE mem")
+            self.db.execute(_MEM_DDL)
+            self.db.executemany(
+                "INSERT INTO mem(rowid, content, folded, kind, session, turn, ts) VALUES (?,?,?,?,?,?,?)",
+                [(rid, c, fold(c), k, s, t, ts) for rid, c, k, s, t, ts in old],
+            )
+        else:
+            self.db.execute(_MEM_DDL)
         self.db.execute("CREATE TABLE IF NOT EXISTS seen(h TEXT PRIMARY KEY)")
         self.db.execute("CREATE TABLE IF NOT EXISTS vec(rid INTEGER PRIMARY KEY, v BLOB)")
         self.db.commit()
+
+    def close(self) -> None:
+        if getattr(self, "db", None) is not None:
+            self.db.close()
+            self.db = None
+
+    def __enter__(self) -> "Memory":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def add(self, content: str, kind: str = "note", turn: int = 0) -> int:
         new: list[tuple[int, str]] = []
@@ -97,24 +129,25 @@ class Memory:
             if self.db.execute("SELECT 1 FROM seen WHERE h=?", (h,)).fetchone():
                 continue
             self.db.execute("INSERT INTO seen VALUES (?)", (h,))
-            cur = self.db.execute("INSERT INTO mem(content, kind, session, turn, ts) VALUES (?,?,?,?,?)",
-                                  (part, kind, self.session, turn, time.time()))
+            cur = self.db.execute("INSERT INTO mem(content, folded, kind, session, turn, ts) VALUES (?,?,?,?,?,?)",
+                                  (part, fold(part), kind, self.session, turn, time.time()))
             new.append((cur.lastrowid, part))
         self.db.commit()
         self._embed_rows(new)
         return len(new)
 
-    def _embed_rows(self, rows: list[tuple[int, str]]) -> None:
+    def _embed_rows(self, rows: list[tuple[int, str]]) -> int:
         """Embedding lỗi thì bỏ qua: mục đó vẫn tìm được bằng BM25, và được bù vector ở lần backfill sau."""
         if not self.embedder or not rows:
-            return
+            return 0
         try:
             vecs = self.embedder.embed([t for _, t in rows])
         except EmbedError:
-            return
-        self.db.executemany("INSERT OR REPLACE INTO vec VALUES (?,?)",
-                            [(rid, v.tobytes()) for (rid, _), v in zip(rows, vecs)])
+            return 0
+        pairs = [(rid, v.tobytes()) for (rid, _), v in zip(rows, vecs)]
+        self.db.executemany("INSERT OR REPLACE INTO vec VALUES (?,?)", pairs)
         self.db.commit()
+        return len(pairs)
 
     def backfill(self, limit: int = 300) -> int:
         """Nhúng các mục chưa có vector (ghi lúc chưa bật embedding). Trả về số mục đã bù."""
@@ -122,16 +155,20 @@ class Memory:
             return 0
         rows = self.db.execute("SELECT rowid, content FROM mem WHERE rowid NOT IN (SELECT rid FROM vec) "
                                "ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+        total = 0
         for i in range(0, len(rows), 16):
-            self._embed_rows(rows[i:i + 16])
-        return len(rows)
+            total += self._embed_rows(rows[i:i + 16])
+        return total
 
     @staticmethod
     def _match_query(q: str) -> str:
-        words = sorted({w for w in re.findall(r"\w{2,}", q.lower()) if w not in STOP}, key=len, reverse=True)[:12]
+        q_low = q.lower()
+        stop = STOP_FOLDED if q_low == fold(q_low) else STOP
+        words = sorted({fold(w) for w in re.findall(r"\w{2,}", q_low) if w not in stop}, key=len, reverse=True)[:12]
         return " OR ".join(f'"{w}"' for w in words)
 
-    def _vector_rank(self, query: str, limit: int) -> list[tuple[int, float]] | None:
+    def _vector_rank(self, query: str, limit: int, first_live_turn: int | None = None,
+                     kinds: tuple[str, ...] | None = None) -> list[tuple[int, float]] | None:
         """[(rowid, cosine)] giảm dần; None nếu embedding không dùng được."""
         if not self.embedder:
             return None
@@ -139,8 +176,16 @@ class Memory:
             qv = self.embedder.embed([query])[0]
         except EmbedError:
             return None
-        scored = [(rid, cosine(qv, array.array("f", blob)))
-                  for rid, blob in self.db.execute("SELECT rid, v FROM vec ORDER BY rid DESC LIMIT 5000")]
+        conds, params = [], []
+        if kinds:
+            conds.append(f"m.kind IN ({','.join('?' * len(kinds))})")
+            params.extend(kinds)
+        if first_live_turn is not None:
+            conds.append("NOT (m.session = ? AND CAST(m.turn AS INTEGER) >= ?)")
+            params.extend([self.session, first_live_turn])
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        sql = f"SELECT v.rid, v.v FROM vec v JOIN mem m ON m.rowid = v.rid{where}"
+        scored = [(rid, cosine(qv, array.array("f", blob))) for rid, blob in self.db.execute(sql, params)]
         scored = sorted((x for x in scored if x[1] >= VEC_MIN), key=lambda x: -x[1])
         return scored[:limit]
 
@@ -151,9 +196,19 @@ class Memory:
         first_live_turn: bỏ qua mục của phiên hiện tại từ lượt này trở đi (đang nằm trong context)."""
         mq = self._match_query(query)
         pool = k * 6 + 10
-        bm25 = [r for (r,) in self.db.execute(
-            "SELECT rowid FROM mem WHERE mem MATCH ? ORDER BY bm25(mem) LIMIT ?", (mq, pool)).fetchall()] if mq else []
-        vec = self._vector_rank(query, pool)
+        bm25: list[int] = []
+        if mq:
+            conds, params = ["mem MATCH ?"], [mq]
+            if kinds:
+                conds.append(f"kind IN ({','.join('?' * len(kinds))})")
+                params.extend(kinds)
+            if first_live_turn is not None:
+                conds.append("NOT (session = ? AND CAST(turn AS INTEGER) >= ?)")
+                params.extend([self.session, first_live_turn])
+            sql = f"SELECT rowid FROM mem WHERE {' AND '.join(conds)} ORDER BY bm25(mem) LIMIT ?"
+            params.append(pool)
+            bm25 = [r for (r,) in self.db.execute(sql, params).fetchall()]
+        vec = self._vector_rank(query, pool, first_live_turn=first_live_turn, kinds=kinds)
         vec_ids = {rid for rid, _ in vec or []}
         ranks: dict[int, float] = {}
         for i, rid in enumerate(bm25):

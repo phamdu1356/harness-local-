@@ -42,13 +42,35 @@ class StageResult:
     output: str
 
 
+class OracleError(RuntimeError):
+    pass
+
+
 class Oracle:
     def __init__(self, script: str | Path, root: str | Path, timeout: int = 900):
-        self.script, self.root, self.timeout = str(script), str(root), timeout
+        self.script = str(Path(script).resolve())
+        self.root = str(Path(root).resolve())
+        self.timeout = timeout
 
     def list_stages(self) -> list[dict]:
-        r = subprocess.run([sys.executable, self.script, "--list"], capture_output=True, text=True, timeout=60)
-        return json.loads(r.stdout)
+        if not Path(self.script).is_file():
+            raise OracleError(f"Không tìm thấy oracle script: {self.script}")
+        try:
+            r = subprocess.run([sys.executable, self.script, "--list"], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise OracleError(f"Không chạy được oracle --list ({self.script}): {e}") from e
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout).strip()[-300:]
+            raise OracleError(f"Oracle --list thoát mã {r.returncode}: {detail}")
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            raise OracleError(f"Oracle --list không trả JSON hợp lệ: {r.stdout[:200]!r}") from e
+        if not isinstance(data, list) or any(
+                not isinstance(s, dict) or not isinstance(s.get("id"), int) or "title" not in s or "brief" not in s
+                for s in data):
+            raise OracleError("Oracle --list phải trả danh sách JSON gồm {id (int), title, brief}")
+        return data
 
     def run(self, upto: int) -> tuple[bool, str]:
         try:
@@ -84,22 +106,28 @@ def condense(out: str) -> str:
 
 
 def run_stages(agent, oracle: Oracle, step_budget: int = 40, max_rounds: int = 4, start: int = 1,
-               unit_verify=None, ui: UI | None = None, on_stage_done=None) -> list[StageResult]:
+               unit_verify=None, ui: UI | None = None, on_stage_done=None,
+               stages: list[dict] | None = None) -> list[StageResult]:
     ui = ui or agent.ui
-    stages = [s for s in oracle.list_stages() if s["id"] >= start]
-    n_total = max((s["id"] for s in oracle.list_stages()), default=len(stages))
+    all_stages = oracle.list_stages() if stages is None else stages
+    todo_stages = [s for s in all_stages if s["id"] >= start]
+    n_total = max((s["id"] for s in all_stages), default=len(todo_stages))
     results: list[StageResult] = []
     saved_steps, saved_verify = agent.max_steps, agent.verify
     agent.max_steps = step_budget
     try:
-        for st in stages:
+        for st in todo_stages:
+            last_gate: list[tuple[bool, str]] = []
+
             def gate(upto=st["id"]):
                 ok, out = oracle.run(upto)
                 if ok and unit_verify:
                     ok_u, out_u = unit_verify()
                     if not ok_u:
-                        return False, "Bộ test của chính bạn (tests/) đang thất bại:\n" + out_u
+                        ok, out = False, "Bộ test của chính bạn (tests/) đang thất bại:\n" + out_u
+                last_gate[:] = [(ok, out)]
                 return ok, out
+
             agent.verify = gate
             ui.w(ui.c("accent", f"\n▶ Giai đoạn {st['id']}/{n_total}: {st['title']}"))
             ok, out = gate()
@@ -107,8 +135,12 @@ def run_stages(agent, oracle: Oracle, step_budget: int = 40, max_rounds: int = 4
             while not ok and rounds < max_rounds:
                 rounds += 1
                 tpl = STAGE_PROMPT if rounds == 1 else FOLLOW_PROMPT
+                last_gate.clear()
                 agent.run(tpl.format(id=st["id"], n=n_total, title=st["title"], brief=st["brief"], output=clip(out, 3500)))
-                ok, out = gate()
+                if last_gate and not agent.exhausted and getattr(agent, "last_verify_ok", None) is not None:
+                    ok, out = last_gate[0]
+                else:
+                    ok, out = gate()
                 ui.w(ui.c("ok" if ok else "err", f"{'✓' if ok else '✗'} giai đoạn {st['id']} sau vòng {rounds}: {'ĐẠT' if ok else 'chưa đạt'}"))
             results.append(StageResult(st["id"], st["title"], ok, rounds, out))
             if on_stage_done:

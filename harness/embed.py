@@ -25,6 +25,8 @@ class EmbedClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 data = json.load(r)["data"]
         except Exception as e:
+            if hasattr(e, "close"):
+                e.close()
             raise EmbedError(f"embedding lỗi: {e}") from e
         out = []
         for d in sorted(data, key=lambda x: x.get("index", 0)):

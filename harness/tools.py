@@ -18,7 +18,7 @@ from typing import Callable
 from . import sandbox as _sandbox
 
 MAX_OUTPUT = 8000
-SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
+SKIP_DIRS = {".git", ".harness", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
 
 
 def clip(text: str, limit: int = MAX_OUTPUT) -> str:
@@ -45,8 +45,11 @@ def closest_block(text: str, old: str, context: int = 1) -> str:
     return "\n".join(f"{j + 1}\t{lines[j]}" for j in range(lo, hi))
 
 
-def P(type_: str, desc: str, optional: bool = False) -> dict:
-    return {"type": type_, "description": desc, "optional": optional}
+def P(type_: str, desc: str, optional: bool = False, nullable: bool = False) -> dict:
+    d = {"type": type_, "description": desc, "optional": optional}
+    if nullable:
+        d["nullable"] = True
+    return d
 
 
 @dataclass
@@ -59,7 +62,7 @@ class Tool:
     read_only: bool = False
 
     def schema(self) -> dict:
-        props = {k: {kk: vv for kk, vv in v.items() if kk != "optional"} for k, v in self.parameters.items()}
+        props = {k: {kk: vv for kk, vv in v.items() if kk not in ("optional", "nullable")} for k, v in self.parameters.items()}
         return {"type": "function", "function": {
             "name": self.name, "description": self.description,
             "parameters": {"type": "object", "properties": props,
@@ -78,6 +81,15 @@ class Tool:
             spec = self.parameters.get(k)
             if not spec:
                 continue  # bỏ tham số lạ
+            if v is None:
+                if spec.get("nullable"):
+                    out[k] = None
+                    continue
+                if spec.get("optional"):
+                    continue
+                return f"LỖI: tham số {k} phải là {spec['type']}, nhận None."
+            if spec["type"] == "integer" and isinstance(v, bool):
+                return f"LỖI: tham số {k} phải là {spec['type']}, nhận {v!r}."
             try:
                 out[k] = int(v) if spec["type"] == "integer" else (v if spec["type"] != "string" else str(v))
             except (TypeError, ValueError):
@@ -114,25 +126,45 @@ def format_searx(data: dict, num: int = 5) -> str:
     return "\n".join(out)
 
 
+def _allowed_path(p: Path, root: Path) -> bool:
+    try:
+        resolved = p.resolve()
+    except (OSError, RuntimeError):
+        return False
+    if resolved != root and not resolved.is_relative_to(root):
+        return False
+    rel = resolved.relative_to(root)
+    return not (rel.parts and rel.parts[0] == ".harness")
+
+
 class Workspace:
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
 
     def path(self, p: str) -> Path:
-        full = (self.root / p).resolve()
-        if full != self.root and self.root not in full.parents:
+        try:
+            full = (self.root / p).resolve()
+        except (OSError, RuntimeError) as e:
+            raise ValueError(f"Đường dẫn không hợp lệ ({p}): {e}") from e
+        if full != self.root and not full.is_relative_to(self.root):
             raise ValueError(f"Đường dẫn nằm ngoài workspace: {p}")
+        rel = full.relative_to(self.root)
+        if rel.parts and rel.parts[0] == ".harness":
+            raise ValueError(f"Không được truy cập thư mục nội bộ .harness/: {p}")
         return full
 
     def rel(self, p: Path) -> str:
         return str(p.relative_to(self.root))
 
 
-def _walk(base: Path):
+def _walk(base: Path, root: Path | None = None):
+    root = (root or base).resolve()
     for dirpath, dirs, files in os.walk(base):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        dirs[:] = [d for d in sorted(dirs) if d not in SKIP_DIRS and _allowed_path(Path(dirpath) / d, root)]
         for f in sorted(files):
-            yield Path(dirpath) / f
+            fp = Path(dirpath) / f
+            if _allowed_path(fp, root):
+                yield fp
 
 
 def build_tools(ws: Workspace, bash_timeout: int = 60, sandbox: bool = True) -> dict[str, Tool]:
@@ -183,13 +215,15 @@ def build_tools(ws: Workspace, bash_timeout: int = 60, sandbox: bool = True) -> 
         return f"Đã sửa {path}"
 
     def list_dir(path: str = ".") -> str:
-        items = sorted(ws.path(path).iterdir(), key=lambda x: (not x.is_dir(), x.name))
-        return clip("\n".join(f"{i.name}{'/' if i.is_dir() else ''}" for i in items if i.name != ".git")) or "(trống)"
+        base = ws.path(path)
+        items = [i for i in base.iterdir() if i.name not in (".git", ".harness") and _allowed_path(i, ws.root)]
+        items.sort(key=lambda x: (not x.is_dir(), x.name))
+        return clip("\n".join(f"{i.name}{'/' if i.is_dir() else ''}" for i in items)) or "(trống)"
 
     def glob(pattern: str, path: str = ".") -> str:
         base = ws.path(path)
         pat = pattern if "/" in pattern or pattern.startswith("**") else f"**/{pattern}"
-        hits = [ws.rel(f) for f in _walk(base) if fnmatch.fnmatch(ws.rel(f), pat) or fnmatch.fnmatch(f.name, pattern)]
+        hits = [ws.rel(f) for f in _walk(base, ws.root) if fnmatch.fnmatch(ws.rel(f), pat) or fnmatch.fnmatch(f.name, pattern)]
         return clip("\n".join(hits[:200])) + (f"\n... {len(hits)} kết quả" if len(hits) > 200 else "") if hits else "Không có file khớp."
 
     def grep(pattern: str, path: str = ".", include: str = "") -> str:
@@ -198,7 +232,7 @@ def build_tools(ws: Workspace, bash_timeout: int = 60, sandbox: bool = True) -> 
         except re.error as e:
             return f"LỖI regex: {e}"
         base, hits = ws.path(path), []
-        for f in ([base] if base.is_file() else _walk(base)):
+        for f in ([base] if base.is_file() else _walk(base, ws.root)):
             if include and not fnmatch.fnmatch(f.name, include):
                 continue
             try:
@@ -214,9 +248,11 @@ def build_tools(ws: Workspace, bash_timeout: int = 60, sandbox: bool = True) -> 
         return clip("\n".join(hits)) or "Không có kết quả."
 
     def move_file(src: str, dst: str) -> str:
-        d = ws.path(dst)
+        s, d = ws.path(src), ws.path(dst)
+        if s == ws.root:
+            return "LỖI: không di chuyển workspace."
         d.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(ws.path(src)), str(d))
+        shutil.move(str(s), str(d))
         return f"Đã chuyển {src} → {dst}"
 
     def delete_file(path: str) -> str:

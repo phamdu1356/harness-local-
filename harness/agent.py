@@ -11,7 +11,7 @@ from typing import Callable
 
 from .client import LLMError, LMStudioClient
 from .memory import Memory, format_hits
-from .tools import P, Tool, Workspace, clip
+from .tools import P, Tool, Workspace, _allowed_path, clip
 from .ui import UI
 
 SYSTEM = """Bạn là trợ lý lập trình chạy trong terminal của người dùng.
@@ -38,6 +38,9 @@ MEMORY_PROMPT = """
 def fingerprint(out: str):
     """Dấu vân của kết quả kiểm tra: tập tên test thất bại (unittest/pytest-style) hoặc đoạn cuối của output."""
     names = re.findall(r"^(?:FAIL|ERROR): (.+?)\s*$", out, re.M)
+    names += re.findall(r"^(?:FAILED|ERROR) (\S+?::\S.*?)(?=\s+-\s|\s*$)", out, re.M)
+    names += re.findall(r"^(?:FAILED|ERROR) ([^\s(]+\.py)(?=\s+-\s|\s*$)", out, re.M)
+    names += re.findall(r"^(\S+?::\S.*?)\s+(?:FAILED|ERROR)(?:\s+\[|\s*$)", out, re.M)
     return frozenset(names) if names else out.strip()[-400:]
 
 
@@ -71,17 +74,37 @@ TEXT_TOOLS_PROMPT = """
 Tool có sẵn:
 {specs}"""
 
-_TOOL_CALL_RX = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
-
-
 def parse_text_tool_calls(text: str) -> list[dict]:
-    calls = []
-    for m in _TOOL_CALL_RX.finditer(text):
+    calls, decoder, pos = [], json.JSONDecoder(), 0
+    while True:
+        m = re.search(r"<tool_call>\s*", text[pos:])
+        if not m:
+            break
+        start = pos + m.end()
         try:
-            d = json.loads(m.group(1))
-            calls.append({"id": f"text_{len(calls)}", "name": d["name"], "arguments": d.get("arguments", {})})
-        except (json.JSONDecodeError, KeyError):
+            d, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            pos = start
             continue
+        tail = re.match(r"\s*</tool_call>", text[end:])
+        if not tail:
+            pos = start
+            continue
+        pos = end + tail.end()
+        if not isinstance(d, dict):
+            continue
+        name = d.get("name")
+        args = d.get("arguments", {})
+        if args is None:
+            args = {}
+        elif isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(name, str) or not name or not isinstance(args, dict):
+            continue
+        calls.append({"id": f"text_{len(calls)}", "name": name, "arguments": args})
     return calls
 
 
@@ -101,7 +124,11 @@ class Agent:
         self.memory, self.effort, self.summarize, self.ctx_total = memory, effort, summarize, ctx_total
         self.verify, self.verify_rounds = verify, verify_rounds
         self.exhausted = False
+        self.last_verify_ok: bool | None = None
+        self.last_verify_output: str = ""
         self.verify_baseline = None   # lỗi đã biết từ trước (chế độ --goal): không tính là hồi quy
+        self.goal_state: dict | None = None
+        self._resumed: bool = False
         self.turn, self.first_live_turn, self._recalled = 0, 1, ""
         self.summary = ""
         self.ledger: list[str] = []   # nhật ký hành động (ghi/sửa/xoá/bash) của các bước đã rời khỏi context
@@ -118,7 +145,7 @@ class Agent:
         self.first_live_turn = self.turn + 1  # các lượt trước /clear chỉ còn trong bộ nhớ ngoài
         for name in CONTEXT_FILES:
             f = self.ws.root / name
-            if f.is_file():
+            if _allowed_path(f, self.ws.root) and f.is_file():
                 system += f"\n\nHướng dẫn của dự án ({name}):\n{clip(f.read_text(errors='replace'), 4000)}"
                 break
         if self.system_extra:
@@ -127,38 +154,80 @@ class Agent:
             specs = "\n".join(json.dumps(t.schema()["function"], ensure_ascii=False) for t in self.tools.values())
             system += TEXT_TOOLS_PROMPT.format(specs=specs)
         self._base_system, self.summary, self.ledger = system, "", []
+        self.goal_state, self._resumed = None, False
+        self.last_verify_ok, self.last_verify_output = None, ""
+        if "todo" in self.tools:
+            self.tools["todo"].state.clear()
         self.messages = [{"role": "system", "content": system}]
 
-    def _apply_system(self):
-        extra = f"\n\nTóm tắt hội thoại trước đó (đã rời khỏi context):\n{self.summary}" if self.summary else ""
+    def _apply_system(self, max_extra_limit: int | None = None):
+        sum_blk = f"\n\nTóm tắt hội thoại trước đó (đã rời khỏi context):\n{self.summary}" if self.summary else ""
+        led_hdr = ("\n\nNHẬT KÝ VIỆC BẠN ĐÃ LÀM (hệ thống tự ghi, gồm cả các bước đã rời khỏi context; ĐỪNG làm lại, "
+                   "hãy đọc file để xem trạng thái hiện tại):\n")
+        budget = self._budget()
+        schema_len = self._schema_len if self.max_context_tokens else 0
+        avail = budget - len(self._base_system) - schema_len
+        max_extra = min(avail, max(300, int(budget * 0.35))) if avail > 0 else 0
+        if max_extra_limit is not None:
+            max_extra = max(0, min(max_extra, max_extra_limit))
+        if len(sum_blk) > max_extra:
+            sum_blk = sum_blk[:max_extra]
+        led_blk = ""
         if self.ledger:
-            extra += ("\n\nNHẬT KÝ VIỆC BẠN ĐÃ LÀM (hệ thống tự ghi, gồm cả các bước đã rời khỏi context; ĐỪNG làm lại, "
-                      "hãy đọc file để xem trạng thái hiện tại):\n" + "\n".join(f"- {x}" for x in self.ledger[-40:]))
-        self.messages[0] = {"role": "system", "content": self._base_system + extra}
+            rem = max_extra - len(sum_blk) - len(led_hdr)
+            chosen: list[str] = []
+            if rem >= 30:
+                for item in reversed(self.ledger[-40:]):
+                    entry = f"- {item}"
+                    need = len(entry) + (1 if chosen else 0)
+                    if rem - need < 0 and chosen:
+                        break
+                    if rem - need < 0:
+                        chosen.append(entry[:rem])
+                        break
+                    chosen.append(entry)
+                    rem -= need
+            if chosen:
+                led_blk = led_hdr + "\n".join(reversed(chosen))
+        self.messages[0] = {"role": "system", "content": self._base_system + sum_blk + led_blk}
 
     ACTION_TOOLS = ("write_file", "edit_file", "move_file", "delete_file", "bash")
+
+    def _record_action(self, name: str, a: dict) -> None:
+        if name not in self.ACTION_TOOLS:
+            return
+        detail = a.get("command") if name == "bash" else a.get("path") or a.get("src") or ""
+        if name == "write_file":
+            detail = f"{detail} ({len(str(a.get('content', '')).splitlines())} dòng)"
+        line = clip(f"{name}: {str(detail).strip()}", 110).replace("\n", " ⏎ ")
+        if self.ledger and self.ledger[-1].split(" (×")[0] == line:
+            n = int(self.ledger[-1].rsplit("(×", 1)[1].rstrip(")")) + 1 if "(×" in self.ledger[-1] else 2
+            self.ledger[-1] = f"{line} (×{n})"
+        else:
+            self.ledger.append(line)
 
     def _ledger_add(self, evicted: list[dict]) -> None:
         """Ghi lại, một cách xác định (không nhờ model), những hành động có tác dụng phụ của các bước sắp bị loại."""
         for m in evicted:
-            for tc in m.get("tool_calls") or []:
-                f = tc.get("function", {})
-                name = f.get("name", "")
-                if name not in self.ACTION_TOOLS:
-                    continue
-                try:
-                    a = json.loads(f.get("arguments") or "{}")
-                except json.JSONDecodeError:
-                    a = {}
-                detail = a.get("command") if name == "bash" else a.get("path") or a.get("src") or ""
-                if name == "write_file":
-                    detail = f"{detail} ({len(str(a.get('content', '')).splitlines())} dòng)"
-                line = clip(f"{name}: {str(detail).strip()}", 110).replace("\n", " ⏎ ")
-                if self.ledger and self.ledger[-1].split(" (×")[0] == line:
-                    n = int(self.ledger[-1].rsplit("(×", 1)[1].rstrip(")")) + 1 if "(×" in self.ledger[-1] else 2
-                    self.ledger[-1] = f"{line} (×{n})"
-                else:
-                    self.ledger.append(line)
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                for tc in tcs:
+                    f = tc.get("function") or {}
+                    name = f.get("name", "")
+                    raw = f.get("arguments")
+                    if isinstance(raw, dict):
+                        a = raw
+                    else:
+                        try:
+                            a = json.loads(raw or "{}")
+                        except (json.JSONDecodeError, TypeError):
+                            a = {}
+                    if not isinstance(a, dict):
+                        a = {}
+                    self._record_action(name, a)
+            elif self.text_tools and m.get("role") == "assistant" and "<tool_call>" in (m.get("content") or ""):
+                for c in parse_text_tool_calls(m["content"]):
+                    self._record_action(c["name"], c["arguments"])
         self.ledger = self.ledger[-80:]
 
     def _ask(self, name: str, args: dict) -> bool:
@@ -186,8 +255,11 @@ class Agent:
         """Độ dài một tin nhắn, tính cả tham số tool_calls (vd nội dung file trong write_file chiếm rất nhiều token)."""
         n = len(m.get("content") or "")
         for tc in m.get("tool_calls") or []:
-            f = tc.get("function", {})
-            n += len(f.get("name", "")) + len(f.get("arguments") or "")
+            f = tc.get("function") or {}
+            args = f.get("arguments")
+            if not isinstance(args, str):
+                args = "" if args is None else json.dumps(args, ensure_ascii=False)
+            n += len(f.get("name") or "") + len(args)
         return n
 
     def _size(self) -> int:
@@ -211,9 +283,30 @@ class Agent:
         if prompt_tokens > 50 and chars:
             self._cpt = min(6.0, max(1.5, 0.5 * self._cpt + 0.5 * chars / prompt_tokens))
 
+    def _evict_pass(self, budget: int) -> tuple[int, list[dict]]:
+        n, evicted = 0, []
+        # B2: đẩy cả lượt cũ ra, cho đến khi vừa ngân sách (tối thiểu giữ lượt hiện tại)
+        while self._size() > budget:
+            starts = [i for i, m in enumerate(self.messages) if "_turn" in m]
+            if len(starts) <= 1:
+                break
+            evicted += self.messages[starts[0]:starts[1]]
+            del self.messages[starts[0]:starts[1]]
+            self.first_live_turn = self.messages[starts[0]]["_turn"]
+            n += 1
+        # B3: một lượt quá dài (agent chạy hàng chục bước): bỏ các bước cũ của chính lượt đó
+        while self._size() > budget:
+            span = self._oldest_step_group()
+            if not span:
+                break
+            evicted += self.messages[span[0]:span[1]]
+            del self.messages[span[0]:span[1]]
+            n += 1
+        return n, evicted
+
     def compact(self) -> int:
         """Giữ context dưới ngân sách. B1: lược kết quả tool cũ. B2: đẩy cả lượt cũ ra khỏi context
-        (đã nằm trong bộ nhớ ngoài; nếu bật summarize thì gộp vào bản tóm tắt). Luôn giữ 2 lượt gần nhất."""
+        (lưu trong bộ nhớ ngoài nếu bật; nếu bật summarize thì gộp vào bản tóm tắt). Luôn giữ lượt hiện tại."""
         budget = self._budget()
         if self._size() <= budget:
             return 0
@@ -233,30 +326,24 @@ class Agent:
                 break
             if m["role"] == "assistant":
                 n += self._shrink_tool_args(m)
-        if self.memory or self.summarize:
-            evicted: list[dict] = []
-            # B2: đẩy cả lượt cũ ra, cho đến khi vừa ngân sách (tối thiểu giữ lượt hiện tại)
-            while self._size() > budget:
-                starts = [i for i, m in enumerate(self.messages) if "_turn" in m]
-                if len(starts) <= 1:
-                    break
-                evicted += self.messages[starts[0]:starts[1]]
-                del self.messages[starts[0]:starts[1]]
-                self.first_live_turn = self.messages[starts[0]]["_turn"]
-                n += 1
-            # B3: một lượt quá dài (agent chạy hàng chục bước): bỏ các bước cũ của chính lượt đó
-            while self._size() > budget:
-                span = self._oldest_step_group()
-                if not span:
-                    break
-                evicted += self.messages[span[0]:span[1]]
-                del self.messages[span[0]:span[1]]
-                n += 1
-            if evicted:
-                self._ledger_add(evicted)
-                self._apply_system()
-            if evicted and self.summarize:
+        dn, evicted = self._evict_pass(budget)
+        n += dn
+        if evicted:
+            self._ledger_add(evicted)
+            self._apply_system()
+            if self.summarize:
                 self._update_summary(evicted)
+            if self._size() > budget:
+                dn2, evicted2 = self._evict_pass(budget)
+                if evicted2:
+                    n += dn2
+                    self._ledger_add(evicted2)
+                    self._apply_system()
+        orig_budget = self._budget()
+        if self._size() > orig_budget:
+            schema_len = self._schema_len if self.max_context_tokens else 0
+            rest_len = sum(self._msg_len(m) for m in self.messages[1:])
+            self._apply_system(max_extra_limit=max(0, orig_budget - len(self._base_system) - schema_len - rest_len))
         return n
 
     @staticmethod
@@ -264,13 +351,15 @@ class Agent:
         """Thay các chuỗi dài trong arguments của tool_calls cũ bằng dấu vết ngắn (vẫn là JSON hợp lệ)."""
         changed = 0
         for tc in m.get("tool_calls") or []:
-            f = tc.get("function", {})
+            f = tc.get("function") or {}
             raw = f.get("arguments") or ""
-            if len(raw) <= limit:
+            if not isinstance(raw, str) or len(raw) <= limit:
                 continue
             try:
                 args = json.loads(raw)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(args, dict):
                 continue
             short = {k: (f"[đã lược {len(v)} ký tự, nội dung đã nằm trên đĩa/bộ nhớ]" if isinstance(v, str) and len(v) > limit else v)
                      for k, v in args.items()}
@@ -299,7 +388,7 @@ class Agent:
             if m["role"] == "user" and "_turn" in m:
                 lines.append(f"Người dùng: {clip(c, 600)}")
             elif m["role"] == "assistant":
-                tools = ", ".join(t["function"]["name"] for t in m.get("tool_calls", []))
+                tools = ", ".join((t.get("function") or {}).get("name") or "?" for t in (m.get("tool_calls") or []))
                 lines.append(f"Trợ lý: {clip(c, 600)}" + (f" [gọi tool: {tools}]" if tools else ""))
             elif m["role"] == "tool" or c.startswith("<tool_result>"):
                 lines.append(f"Kết quả tool: {clip(c, 300)}")
@@ -341,25 +430,79 @@ class Agent:
             return True
         return False
 
+    def cleanup_interrupted(self) -> None:
+        """Dọn tin nhắn dở dang khi bị ngắt giữa chừng (KeyboardInterrupt) để lịch sử hội thoại luôn hợp lệ."""
+        if self.drop_dangling_turn():
+            return
+        turn_idx = next((i for i in range(len(self.messages) - 1, -1, -1)
+                         if self.messages[i].get("_turn") == self.turn), None)
+        if turn_idx is None:
+            return
+        for i in range(len(self.messages) - 1, turn_idx, -1):
+            m = self.messages[i]
+            if m.get("role") == "assistant":
+                tcs = m.get("tool_calls") or []
+                if tcs:
+                    answered = {tm.get("tool_call_id") for tm in self.messages[i + 1:] if tm.get("role") == "tool"}
+                    missing = [tc for tc in tcs if tc.get("id") not in answered]
+                    if missing:
+                        if not answered and i == turn_idx + 1:
+                            del self.messages[i:]
+                            self.drop_dangling_turn()
+                            return
+                        for tc in missing:
+                            self.messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                                  "content": "[đã ngắt bởi người dùng]"})
+                break
+        if self.messages and self.messages[-1].get("role") in ("tool", "user"):
+            if self.messages[-1].get("_turn") == self.turn:
+                self.drop_dangling_turn()
+            else:
+                self.messages.append({"role": "assistant", "content": "[đã ngắt bởi người dùng]"})
+
     # ---------- lưu / mở lại phiên ----------
     def save(self, path) -> None:
         from pathlib import Path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        data = {"messages": self.messages, "summary": self.summary, "ledger": self.ledger, "turn": self.turn,
-                "first_live_turn": self.first_live_turn,
-                "memory_session": self.memory.session if self.memory else None}
+        data = {
+            "messages": self.messages, "summary": self.summary, "ledger": self.ledger, "turn": self.turn,
+            "first_live_turn": self.first_live_turn,
+            "memory_session": self.memory.session if self.memory else None,
+            "todo": list(self.tools["todo"].state) if "todo" in self.tools else [],
+            "goal_state": self.goal_state,
+        }
         Path(path).write_text(json.dumps(data, ensure_ascii=False))
 
-    def load(self, path) -> bool:
+    @staticmethod
+    def _parse_session(path) -> dict | None:
         from pathlib import Path
         try:
             data = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        msgs, turn, flt = data.get("messages"), data.get("turn"), data.get("first_live_turn")
+        if (not isinstance(msgs, list) or not all(isinstance(m, dict) for m in msgs)
+                or not isinstance(turn, int) or isinstance(turn, bool)
+                or not isinstance(flt, int) or isinstance(flt, bool)):
+            return None
+        return data
+
+    def load(self, path) -> bool:
+        data = self._parse_session(path)
+        if data is None:
             return False
-        self.messages, self.summary = data["messages"], data.get("summary", "")
-        self.ledger = data.get("ledger", [])
+        self.messages = data["messages"]
+        self.summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        self.ledger = data.get("ledger") if isinstance(data.get("ledger"), list) else []
         self.turn, self.first_live_turn = data["turn"], data["first_live_turn"]
-        if self.memory and data.get("memory_session"):
+        if "todo" in self.tools and isinstance(data.get("todo"), list):
+            self.tools["todo"].state[:] = [str(x) for x in data["todo"]]
+        gs = data.get("goal_state")
+        self.goal_state = gs if isinstance(gs, dict) else None
+        self._resumed = True
+        if self.memory and isinstance(data.get("memory_session"), str) and data["memory_session"]:
             self.memory.session = data["memory_session"]
         self._apply_system()  # lấy prompt hệ thống mới nhất + tóm tắt đã lưu
         return True
@@ -369,18 +512,20 @@ class Agent:
         """Nhắc agent khi thấy kiểu làm việc kém hiệu quả (tối đa một lần mỗi 12 bước)."""
         if steps - st["nudged"] < 12:
             return ""
-        if "todo" in self.tools and steps - st["todo"] >= 20:
-            st["nudged"] = steps
-            return (f"[Nhắc] Đã {steps - st['todo']} bước mà bạn chưa cập nhật kế hoạch. Hãy gọi tool todo để ghi việc đã "
-                    "xong/đang làm/còn lại (theo thứ tự ưu tiên của yêu cầu), rồi tiếp tục.")
         last = hist[-8:]
         if len(last) == 8 and sum(1 for n, a in last if n == "bash" and "python3 -c" in str(a.get("command", ""))) >= 6:
             st["nudged"] = steps
             return ("[Nhắc] Bạn đang chạy script python -c lẻ nhiều lần liên tiếp. Hãy dừng mò: dùng read_file đọc đúng đoạn "
                     "mã liên quan (có số dòng) hoặc grep, nêu giả thuyết về nguyên nhân, rồi sửa bằng edit_file và chạy lại test.")
+        if "todo" in self.tools and steps - st["todo"] >= 20:
+            gap = steps - st["todo"]
+            st["nudged"] = st["todo"] = steps
+            return (f"[Nhắc] Đã {gap} bước mà bạn chưa cập nhật kế hoạch. Hãy gọi tool todo để ghi việc đã "
+                    "xong/đang làm/còn lại (theo thứ tự ưu tiên của yêu cầu), rồi tiếp tục.")
         if steps - st.get("edit", 0) >= 25:
-            st["nudged"] = steps
-            return (f"[Nhắc] Đã {steps - st.get('edit', 0)} bước mà bạn chưa sửa được file nào: có thể bạn đang mò hoặc lặp. "
+            gap = steps - st.get("edit", 0)
+            st["nudged"] = st["edit"] = steps
+            return (f"[Nhắc] Đã {gap} bước mà bạn chưa sửa được file nào: có thể bạn đang mò hoặc lặp. "
                     "Hãy đổi chiến lược: đọc lại thông báo lỗi thật (read_file/grep), chia nhỏ vấn đề, chọn MỘT giả thuyết, "
                     "sửa bằng edit_file rồi chạy lại test; nếu kẹt ở một chỗ quá lâu thì chuyển sang việc ưu tiên kế tiếp "
                     "và ghi chú chỗ kẹt trong todo.")
@@ -394,7 +539,7 @@ class Agent:
     def _chat(self, schemas):
         overflow_retried = net_retried = False
         while True:
-            self._schema_len = len(json.dumps(schemas)) if schemas else 0
+            self._schema_len = len(json.dumps(schemas, ensure_ascii=False)) if schemas else 0
             self.ui.spinner_start()
             try:
                 return self.client.chat(self._view(), schemas,
@@ -418,9 +563,11 @@ class Agent:
         self.turn += 1
         self._recalled, self._shrink = "", 1.0
         self.exhausted = False   # True nếu lượt này dừng vì hết ngân sách bước (không phải kết thúc tự nhiên)
+        self.last_verify_ok = None
+        self.last_verify_output = ""
         self.messages.append({"role": "user", "content": user_input, "_turn": self.turn})
         schemas = None if self.text_tools else [t.schema() for t in self.tools.values()]
-        self._schema_len = len(json.dumps(schemas)) if schemas else 0
+        self._schema_len = len(json.dumps(schemas, ensure_ascii=False)) if schemas else 0
         if self.memory:
             self.compact()  # dọn trước, để first_live_turn phản ánh đúng những gì còn trong context
             hits = self.memory.search(user_input, k=4, first_live_turn=self.first_live_turn)
@@ -431,86 +578,97 @@ class Agent:
         empties = 0
         hist: list[tuple[str, dict]] = []
         nst = {"nudged": 0, "todo": 0}
-        for _ in range(self.max_steps):
-            steps += 1
-            self.compact()
-            reply = self._chat(schemas)
-            if reply.prompt_tokens:
-                self._calibrate(self._view(), reply.prompt_tokens)
-            if reply.aborted and not reply.tool_calls:
-                why = ("bị lặp một câu nhiều lần" if reply.aborted == "repetition" else "quá dài mà chưa hành động")
-                self.ui.error(f"suy nghĩ của model {why}, đã ngắt luồng")
-                self.messages.append({"role": "assistant", "content": reply.content or "(suy nghĩ bị ngắt)"})
-                self.messages.append({"role": "user", "content": (
-                    f"[Hệ thống] Suy nghĩ của bạn {why} nên bị ngắt. Đừng phân tích vòng tròn nữa: chọn MỘT hành động cụ thể "
-                    "(đọc đúng đoạn file bằng read_file, sửa bằng edit_file, hoặc chạy test) và làm ngay; nếu chưa chắc nguyên "
-                    "nhân thì đọc mã/thông báo lỗi thật để lấy thêm dữ kiện.")})
-                continue
-            calls = reply.tool_calls or parse_text_tool_calls(reply.content)
-            if not calls and not reply.content.strip() and empties < 2:
-                # model chỉ "nghĩ" rồi trả về rỗng (không nói gì, không gọi tool): đó không phải là kết thúc
-                empties += 1
-                self.ui.error(f"model trả lời rỗng (chỉ suy nghĩ), nhắc và thử lại ({empties}/2)")
-                self.messages.append({"role": "assistant", "content": "(không có nội dung)"})
-                self.messages.append({"role": "user", "content": (
-                    "[Hệ thống] Bạn chưa trả lời gì và chưa gọi tool nào. Hãy thực hiện ngay hành động bạn vừa định làm "
-                    "bằng cách GỌI TOOL, hoặc nếu đã xong thì báo kết quả bằng câu trả lời có nội dung.")})
-                continue
-            msg: dict = {"role": "assistant", "content": reply.content}
-            if reply.tool_calls:
-                msg["tool_calls"] = [
-                    {"id": c["id"], "type": "function",
-                     "function": {"name": c["name"], "arguments": json.dumps(c["arguments"], ensure_ascii=False)}}
-                    for c in reply.tool_calls]
-            self.messages.append(msg)
-            if not calls:
-                final = reply.content
-                if self.verify and rounds < self.verify_rounds:
-                    last_ok, out = self.verify()
-                    fp = fingerprint(out)
-                    if not last_ok and _no_regression(fp, self.verify_baseline):
-                        self.ui.w(self.ui.c("muted", "◌ kiểm tra: chỉ còn lỗi đã có từ trước, không có hồi quy mới → tính là đạt"))
-                        last_ok = True
+        try:
+            for _ in range(self.max_steps):
+                steps += 1
+                self.compact()
+                reply = self._chat(schemas)
+                if reply.prompt_tokens:
+                    self._calibrate(self._view(), reply.prompt_tokens)
+                if reply.aborted and not reply.tool_calls:
+                    why = ("bị lặp một câu nhiều lần" if reply.aborted == "repetition" else "quá dài mà chưa hành động")
+                    self.ui.error(f"suy nghĩ của model {why}, đã ngắt luồng")
+                    self.messages.append({"role": "assistant", "content": reply.content or "(suy nghĩ bị ngắt)"})
+                    self.messages.append({"role": "user", "content": (
+                        f"[Hệ thống] Suy nghĩ của bạn {why} nên bị ngắt. Đừng phân tích vòng tròn nữa: chọn MỘT hành động cụ thể "
+                        "(đọc đúng đoạn file bằng read_file, sửa bằng edit_file, hoặc chạy test) và làm ngay; nếu chưa chắc nguyên "
+                        "nhân thì đọc mã/thông báo lỗi thật để lấy thêm dữ kiện.")})
+                    continue
+                calls = reply.tool_calls or (parse_text_tool_calls(reply.content) if self.text_tools else [])
+                if not calls and not reply.content.strip() and empties < 2:
+                    # model chỉ "nghĩ" rồi trả về rỗng (không nói gì, không gọi tool): đó không phải là kết thúc
+                    empties += 1
+                    self.ui.error(f"model trả lời rỗng (chỉ suy nghĩ), nhắc và thử lại ({empties}/2)")
+                    self.messages.append({"role": "assistant", "content": "(không có nội dung)"})
+                    self.messages.append({"role": "user", "content": (
+                        "[Hệ thống] Bạn chưa trả lời gì và chưa gọi tool nào. Hãy thực hiện ngay hành động bạn vừa định làm "
+                        "bằng cách GỌI TOOL, hoặc nếu đã xong thì báo kết quả bằng câu trả lời có nội dung.")})
+                    continue
+                empties = 0
+                msg: dict = {"role": "assistant", "content": reply.content}
+                if reply.tool_calls:
+                    msg["tool_calls"] = [
+                        {"id": c["id"], "type": "function",
+                         "function": {"name": c["name"], "arguments": json.dumps(c["arguments"], ensure_ascii=False)}}
+                        for c in reply.tool_calls]
+                self.messages.append(msg)
+                if not calls:
+                    final = reply.content
+                    if self.verify:
+                        last_ok, out = self.verify()
+                        fp = fingerprint(out)
+                        if not last_ok and _no_regression(fp, self.verify_baseline):
+                            self.ui.w(self.ui.c("muted", "◌ kiểm tra: chỉ còn lỗi đã có từ trước, không có hồi quy mới → tính là đạt"))
+                            last_ok = True
+                        elif last_ok or rounds < self.verify_rounds:
+                            self.ui.verify_note(last_ok, rounds + 1, self.verify_rounds)
+                        self.last_verify_ok = last_ok
+                        self.last_verify_output = out
+                        if not last_ok and rounds < self.verify_rounds:
+                            rounds += 1
+                            advice = REPEAT_FAIL_ADVICE if fp == prev_fp else ""
+                            prev_fp = fp
+                            self.last_verify_ok = None
+                            self.messages.append({"role": "user", "content": (
+                                "[Kiểm tra tự động] Bạn báo xong nhưng lệnh kiểm tra THẤT BẠI, nên bạn CHƯA xong:\n"
+                                f"{clip(out, 3000)}{advice}\nHãy tìm nguyên nhân thật rồi sửa, chạy lại kiểm tra và chỉ báo xong khi nó đạt.")})
+                            continue
+                    break
+                for c in calls:
+                    self.ui.tool_call(c["name"], c["arguments"])
+                    if c.get("arg_error"):
+                        result = f"LỖI: {c['arg_error']}"
                     else:
-                        self.ui.verify_note(last_ok, rounds + 1, self.verify_rounds)
-                    if not last_ok:
-                        rounds += 1
-                        advice = REPEAT_FAIL_ADVICE if fp == prev_fp else ""
-                        prev_fp = fp
-                        self.messages.append({"role": "user", "content": (
-                            "[Kiểm tra tự động] Bạn báo xong nhưng lệnh kiểm tra THẤT BẠI, nên bạn CHƯA xong:\n"
-                            f"{clip(out, 3000)}{advice}\nHãy tìm nguyên nhân thật rồi sửa, chạy lại kiểm tra và chỉ báo xong khi nó đạt.")})
-                        continue
-                break
-            for c in calls:
-                self.ui.tool_call(c["name"], c["arguments"])
-                key = c["name"] + json.dumps(c["arguments"], sort_keys=True, ensure_ascii=False)
-                seen[key] = seen.get(key, 0) + 1
-                if seen[key] >= 4:
-                    result = "LỖI: đã gọi cùng một tool với cùng tham số 4 lần. Dừng lặp: đổi cách làm hoặc trả lời người dùng."
-                else:
-                    result = self._execute(c["name"], c["arguments"])
-                    if seen[key] == 3:
-                        result += "\n[Lưu ý: đây là lần thứ 3 bạn gọi y hệt. Hãy đổi cách tiếp cận.]"
-                hist.append((c["name"], c["arguments"]))
-                if c["name"] == "todo":
-                    nst["todo"] = steps
-                if c["name"] in ("edit_file", "write_file") and not result.startswith("LỖI"):
-                    nst["edit"] = steps
-                if note := self._nudge(hist, steps, nst):
-                    result += "\n" + note
-                self.ui.tool_result(result)
-                if self.memory and c["name"] not in ("recall", "remember", "todo"):
-                    self.memory.add(f"{c['name']} {json.dumps(c['arguments'], ensure_ascii=False)}\n{result}",
-                                    "tool", self.turn)
-                if self.text_tools:  # không dùng tool role native: đưa kết quả như tin nhắn user
-                    self.messages.append({"role": "user", "content": f"<tool_result>\n{result}\n</tool_result>"})
-                else:
-                    self.messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "content": result})
-        else:
-            self.exhausted = True
-            self.ui.error(f"dừng: quá {self.max_steps} bước")
-        if self.verify and last_ok is False:
+                        key = c["name"] + json.dumps(c["arguments"], sort_keys=True, ensure_ascii=False)
+                        seen[key] = seen.get(key, 0) + 1
+                        if seen[key] >= 4:
+                            result = "LỖI: đã gọi cùng một tool với cùng tham số 4 lần. Dừng lặp: đổi cách làm hoặc trả lời người dùng."
+                        else:
+                            result = self._execute(c["name"], c["arguments"])
+                            if seen[key] == 3:
+                                result += "\n[Lưu ý: đây là lần thứ 3 bạn gọi y hệt. Hãy đổi cách tiếp cận.]"
+                    hist.append((c["name"], c["arguments"]))
+                    if c["name"] == "todo":
+                        nst["todo"] = steps
+                    if c["name"] in ("edit_file", "write_file") and not result.startswith("LỖI"):
+                        nst["edit"] = steps
+                    if note := self._nudge(hist, steps, nst):
+                        result += "\n" + note
+                    self.ui.tool_result(result)
+                    if self.memory and c["name"] not in ("recall", "remember", "todo"):
+                        self.memory.add(f"{c['name']} {json.dumps(c['arguments'], ensure_ascii=False)}\n{result}",
+                                        "tool", self.turn)
+                    if self.text_tools and not reply.tool_calls:  # không dùng tool role native: đưa kết quả như tin nhắn user
+                        self.messages.append({"role": "user", "content": f"<tool_result>\n{result}\n</tool_result>"})
+                    else:
+                        self.messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "content": result})
+            else:
+                self.exhausted = True
+                self.ui.error(f"dừng: quá {self.max_steps} bước")
+        except KeyboardInterrupt:
+            self.cleanup_interrupted()
+            raise
+        if self.verify and self.last_verify_ok is False:
             self.ui.error(f"kiểm tra tự động VẪN thất bại sau {self.verify_rounds} vòng: kết quả chưa đáng tin")
         if self.memory:
             self.memory.add(f"Hỏi: {user_input}\nĐáp: {final}", "turn", self.turn)

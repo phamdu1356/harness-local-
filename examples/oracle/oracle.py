@@ -32,8 +32,18 @@ from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from harness import sandbox  # noqa: E402
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "harness" / "sandbox.py").is_file():
+        sys.path.insert(0, str(_parent))
+        break
+try:
+    from harness import sandbox  # noqa: E402
+except ImportError:
+    class sandbox:  # chạy độc lập khi copy oracle.py ra ngoài repo
+        @staticmethod
+        def available() -> bool: return False
+        @staticmethod
+        def wrap(cmd: str, root: str | Path) -> list[str]: return ["bash", "-c", cmd]
 
 TOKEN = "123456:ABC-FAKE-TOKEN"
 CHAT = "1001"
@@ -274,8 +284,9 @@ class App:
         self.logf.parent.mkdir(parents=True, exist_ok=True)
         full = {**os.environ, **self.env, "PYTHONDONTWRITEBYTECODE": "1"}
         cmd = sandbox.wrap("python3 -m people_memory", self.root) if sandbox.available() else ["bash", "-c", "python3 -m people_memory"]
-        self.proc = subprocess.Popen(cmd, cwd=self.root, env=full, stdout=open(self.logf, "ab"), stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, start_new_session=True)
+        with open(self.logf, "ab") as logf:
+            self.proc = subprocess.Popen(cmd, cwd=self.root, env=full, stdout=logf, stderr=subprocess.STDOUT,
+                                         stdin=subprocess.DEVNULL, start_new_session=True)
         t0 = time.time()
         while time.time() - t0 < wait:
             if self.proc.poll() is not None:
@@ -300,6 +311,8 @@ class App:
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(self.proc.pid, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self.proc.wait(2)
         self.proc = None
 
     def restart(self):
@@ -550,7 +563,7 @@ def c3_alias(root, n):
         ppl = sc.people()
         need(len(ppl) == 1, "tên 'my' (khác hoa/thường) phải được gộp (vẫn 1 người)", {"text": S_F}, clip(ppl))
         al = {norm(a) for a in ppl[0].get("aliases", [])}
-        need({"my", "em my"} <= al or {"em my"} <= al, "biệt danh 'em My' phải được thêm vào aliases", None, clip(ppl[0]))
+        need("em my" in al, "biệt danh 'em My' phải được thêm vào aliases", None, clip(ppl[0]))
         texts = {f["text"] for f in sc.profile(ppl[0]["id"])["facts"]}
         need({"vừa đổi việc sang công ty mới", "thích hoa hồng", "không thích ăn hành"} <= texts, "fact từ các tin gộp phải nằm trong hồ sơ của một người", None, sorted(texts))
 
@@ -585,9 +598,10 @@ def c3_ask(root, n):
         need("dị ứng hải sản" in texts, "facts phải chứa fact active 'dị ứng hải sản' của My", None, clip(r.json))
         need(isinstance(r.json.get("answer"), str) and r.json["answer"].strip(), "answer phải là chuỗi không rỗng", None, clip(r.json))
         r2 = sc.app.post("/api/ask", {"question": "Lan thích ăn gì?"})
+        need(r2.status == 200 and isinstance(r2.json, dict), "POST /api/ask (Lan) phải trả 200 JSON", {"question": "Lan thích ăn gì?"}, f"{r2.status} {clip(r2.text)}")
         t2 = [f.get("text") for f in r2.json.get("facts", [])]
         need("đang đau dạ dày, phải kiêng cay" in t2 and "thích ăn cay" not in t2, "ask phải chỉ trả fact ACTIVE (không trả bản cũ superseded)", None, clip(r2.json))
-        need(all(f.get("status") == "active" for f in r.json.get("facts", [])), "mọi fact trả về phải active", None, clip(r.json.get("facts")))
+        need(all(f.get("status") == "active" for f in r.json.get("facts", []) + r2.json.get("facts", [])), "mọi fact trả về phải active", None, clip(r2.json.get("facts")))
 
 
 @check(3, "/api/ask với người không có: không bịa và không gọi LLM")

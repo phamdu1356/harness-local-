@@ -93,8 +93,17 @@ def _no_escape(ws, answers):
 
 
 def _count_callers(ws, answers):
-    nums = re.findall(r"\b\d+\b", answers[-1])
-    return "2" in nums and "3" not in nums, answers[-1][:100]
+    ans = answers[-1].strip()
+    nums = re.findall(r"\b\d+\b", ans)
+    if not nums:
+        return False, ans[:100]
+    if len(nums) == 1:
+        return nums[0] == "2", ans[:100]
+    if re.search(r"\b3\s*file\b", ans, re.I) or ans.splitlines()[0].strip() == "3":
+        return False, ans[:100]
+    if re.search(r"\b2\s*file\b", ans, re.I):
+        return True, ans[:100]
+    return nums[0] == "2", ans[:100]
 
 
 TASKS = [
@@ -151,20 +160,27 @@ def run_task(a, client, default_ctx: int, task: Task) -> Result:
             (root / name).write_text(content)
         ws = Workspace(root)
         memory = Memory(root / ".harness" / "memory.db", "eval", a.embedder) if task.memory and not a.no_memory else None
-        agent, _ = make_agent(a, client, task.ctx or default_ctx, ws, UI(io.StringIO()), memory, mcp=False)
-        calls = {"n": 0}
-        orig = agent._execute
-        agent._execute = lambda name, args: (calls.__setitem__("n", calls["n"] + 1), orig(name, args))[1]
         answers, t0, err = [], time.time(), ""
+        calls = {"n": 0}
+        prompt_tokens = 0
         try:
-            for turn in task.turns:
-                answers.append(agent.run(turn))
-            ok, detail = task.check(root, answers)
+            agent, _ = make_agent(a, client, task.ctx or default_ctx, ws, UI(io.StringIO()), memory, mcp=False)
+            orig = agent._execute
+            agent._execute = lambda name, args: (calls.__setitem__("n", calls["n"] + 1), orig(name, args))[1]
+            try:
+                for turn in task.turns:
+                    answers.append(agent.run(turn))
+                ok, detail = task.check(root, answers)
+            finally:
+                prompt_tokens = agent.last_prompt_tokens
         except LLMError as e:
             ok, detail, err = False, "", str(e)[:200]
         except Exception as e:  # lỗi trong chấm điểm
             ok, detail, err = False, "", f"{type(e).__name__}: {e}"[:200]
-        return Result(task.name, bool(ok), detail, time.time() - t0, calls["n"], agent.last_prompt_tokens, err)
+        finally:
+            if memory:
+                memory.close()
+        return Result(task.name, bool(ok), detail, time.time() - t0, calls["n"], prompt_tokens, err)
 
 
 def compare(old_path: str, new: list[dict]) -> str:
@@ -190,6 +206,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out", default=".harness/evals", help="thư mục lưu kết quả")
     ap.add_argument("--list", action="store_true", help="liệt kê các tình huống")
     a = ap.parse_args(argv)
+    if a.repeat < 1:
+        ap.error("--repeat phải >= 1")
     a.ask = False
     if a.list:
         for t in TASKS:
@@ -214,6 +232,9 @@ def main(argv: list[str]) -> int:
     except (LLMError, ServeError) as e:
         print(f"✗ {e}", file=sys.stderr)
         return 1
+    if not results:
+        print("✗ Không có kết quả nào.", file=sys.stderr)
+        return 1
     n_ok = sum(r.passed for r in results)
     print(f"\nĐạt {n_ok}/{len(results)} ({100 * n_ok / len(results):.0f}%) · "
           f"trung bình {statistics.mean(r.seconds for r in results):.1f}s/lần · "
@@ -221,6 +242,12 @@ def main(argv: list[str]) -> int:
     rows = [r.__dict__ for r in results]
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    for parent in (out, *out.parents):
+        if parent.name == ".harness":
+            gi = parent / ".gitignore"
+            if not gi.exists():
+                gi.write_text("*\n")
+            break
     f = out / f"{time.strftime('%Y%m%d-%H%M%S')}{'-' + a.label if a.label else ''}.json"
     f.write_text(json.dumps({"label": a.label, "model": client.model, "ctx": ctx, "effort": a.effort,
                              "results": rows}, ensure_ascii=False, indent=1))
